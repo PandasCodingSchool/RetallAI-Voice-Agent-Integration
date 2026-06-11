@@ -6,6 +6,49 @@ import { logger } from "../utils/logger";
 
 const RETELL_WS_BASE = "wss://api.retellai.com/audio-websocket";
 
+interface SmartflowConnectedEvent {
+  event: "connected";
+}
+
+interface SmartflowStartEvent {
+  event: "start";
+  streamSid: string;
+  start: {
+    streamSid: string;
+    callSid: string;
+    accountSid: string;
+    from: string;
+    to: string;
+    direction: string;
+    mediaFormat: {
+      encoding: string;
+      sampleRate: number;
+      bitRate: number;
+      bitDepth: number;
+    };
+    customParameters?: Record<string, string>;
+  };
+}
+
+interface SmartflowMediaEvent {
+  event: "media";
+  sequenceNumber: string;
+  streamSid: string;
+  media: { chunk: string; timestamp: string; payload: string };
+}
+
+interface SmartflowStopEvent {
+  event: "stop";
+  streamSid: string;
+  stop: { accountSid: string; callSid: string; reason: string };
+}
+
+type SmartflowEvent =
+  | SmartflowConnectedEvent
+  | SmartflowStartEvent
+  | SmartflowMediaEvent
+  | SmartflowStopEvent;
+
 export function attachWebSocketBridge(server: http.Server): WebSocketServer {
   const wss = new WebSocketServer({ server, path: "/stream" });
 
@@ -29,6 +72,9 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     }
 
     session.smartflowWs = smartflowWs;
+    let streamSid = "";
+    let chunkCounter = 0;
+    let cleanupCalled = false;
 
     logger.info("Smartflow WebSocket connected", {
       token,
@@ -38,9 +84,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
 
     const retellWsUrl = `${RETELL_WS_BASE}/${session.retellCallId}`;
     const retellWs = new WebSocket(retellWsUrl, {
-      headers: {
-        Authorization: `Bearer ${session.retellAccessToken}`,
-      },
+      headers: { Authorization: `Bearer ${session.retellAccessToken}` },
     });
     session.retellWs = retellWs;
 
@@ -50,41 +94,108 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
       });
     });
 
-    smartflowWs.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
-      if (retellWs.readyState === WebSocket.OPEN) {
-        retellWs.send(data, { binary: isBinary });
+    smartflowWs.on("message", (raw: WebSocket.RawData) => {
+      let msg: SmartflowEvent;
+      try {
+        msg = JSON.parse(raw.toString()) as SmartflowEvent;
+      } catch {
+        logger.warn("Smartflow: non-JSON frame received, ignoring");
+        return;
+      }
+
+      switch (msg.event) {
+        case "connected":
+          logger.info("Smartflow stream connected handshake", { token });
+          break;
+
+        case "start":
+          streamSid = msg.streamSid ?? msg.start?.streamSid ?? "";
+          logger.info("Smartflow stream started", {
+            streamSid,
+            mediaFormat: msg.start?.mediaFormat,
+            from: msg.start?.from,
+            to: msg.start?.to,
+          });
+          break;
+
+        case "media": {
+          if (retellWs.readyState !== WebSocket.OPEN) return;
+          const rawAudio = Buffer.from(msg.media.payload, "base64");
+          retellWs.send(rawAudio, { binary: true });
+          break;
+        }
+
+        case "stop":
+          logger.info("Smartflow stream stop event received", {
+            streamSid,
+            reason: msg.stop?.reason,
+          });
+          cleanup("smartflow-stop");
+          break;
+
+        default:
+          logger.debug("Smartflow: unknown event", {
+            event: (msg as SmartflowEvent & { event: string }).event,
+          });
       }
     });
 
     retellWs.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
       if (isBinary) {
-        if (smartflowWs.readyState === WebSocket.OPEN) {
-          smartflowWs.send(data, { binary: true });
+        if (smartflowWs.readyState !== WebSocket.OPEN) return;
+
+        const audioBuf =
+          data instanceof Buffer ? data : Buffer.from(data as ArrayBuffer);
+        chunkCounter++;
+
+        const mediaMsg = JSON.stringify({
+          event: "media",
+          streamSid,
+          media: {
+            payload: audioBuf.toString("base64"),
+            chunk: chunkCounter,
+          },
+        });
+
+        smartflowWs.send(mediaMsg);
+
+        if (chunkCounter === 1) {
+          logger.info("First agent audio frame sent to Smartflow", {
+            retellCallId: session.retellCallId,
+            bytes: audioBuf.length,
+          });
         }
       } else {
         const text = data.toString();
         try {
           const parsed = JSON.parse(text) as { content?: string };
           if (parsed.content === "clear") {
-            logger.debug("Retell barge-in/clear signal received", {
-              retellCallId: session.retellCallId,
-            });
+            logger.info(
+              "Retell barge-in clear signal — forwarding clear to Smartflow",
+              {
+                retellCallId: session.retellCallId,
+              },
+            );
+            if (smartflowWs.readyState === WebSocket.OPEN) {
+              smartflowWs.send(JSON.stringify({ event: "clear", streamSid }));
+            }
           }
         } catch {
-          logger.debug("Retell text frame (non-JSON)", {
-            retellCallId: session.retellCallId,
-            text,
-          });
+          logger.debug("Retell text frame (non-JSON)", { text });
         }
       }
     });
 
     const cleanup = (source: string) => {
+      if (cleanupCalled) return;
+      cleanupCalled = true;
+
       logger.info("Call session ending", {
         source,
         token,
         smartflowCallId: session.smartflowCallId,
         retellCallId: session.retellCallId,
+        chunksSentToSmartflow: chunkCounter,
       });
 
       if (

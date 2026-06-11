@@ -3,6 +3,10 @@ import WebSocket from "ws";
 
 const SERVER_HTTP = process.env["SERVER_HTTP"] ?? "http://localhost:3000";
 const SERVER_WSS = process.env["SERVER_WSS"] ?? "ws://localhost:3000";
+const CALL_DURATION_MS = parseInt(
+  process.env["CALL_DURATION_MS"] ?? "10000",
+  10,
+);
 
 const MOCK_CALL = {
   callId: `sim-${Date.now()}`,
@@ -11,19 +15,23 @@ const MOCK_CALL = {
   status: "ringing",
 };
 
-const AUDIO_FRAME_BYTES = 320;
-const AUDIO_SEND_INTERVAL_MS = 20;
-const CALL_DURATION_MS = parseInt(
-  process.env["CALL_DURATION_MS"] ?? "10000",
-  10,
-);
+const STREAM_SID = "MZsimulated000000000000000000000001";
+const ACCOUNT_SID = "ACsimulated000000000000000000000001";
+const CALL_SID = `CA${MOCK_CALL.callId}`;
 
-function makeSilenceFrame(): Buffer {
-  return Buffer.alloc(AUDIO_FRAME_BYTES, 0xff);
+const AUDIO_CHUNK_BYTES = 800;
+const AUDIO_SEND_INTERVAL = 100;
+
+function makeSilenceChunk(): string {
+  return Buffer.alloc(AUDIO_CHUNK_BYTES, 0xff).toString("base64");
+}
+
+function send(ws: WebSocket, obj: unknown): void {
+  ws.send(JSON.stringify(obj));
 }
 
 async function run(): Promise<void> {
-  console.log("=== Smartflow Simulator ===");
+  console.log("=== Smartflow Protocol Simulator ===");
   console.log(`Server:  ${SERVER_HTTP}`);
   console.log(`Call ID: ${MOCK_CALL.callId}`);
   console.log("");
@@ -48,7 +56,6 @@ async function run(): Promise<void> {
     );
     const pathPart = resp.data.wss_url.replace(/^wss?:\/\/[^/]+/, "");
     wssUrl = `wss://${cleanWssHost}${pathPart}`;
-
     console.log(`[1/3] Got wss_url: ${wssUrl}`);
   } catch (err) {
     console.error("[1/3] FAILED:", err instanceof Error ? err.message : err);
@@ -59,57 +66,130 @@ async function run(): Promise<void> {
   const ws = new WebSocket(wssUrl);
 
   let audioInterval: ReturnType<typeof setInterval> | null = null;
-  let framesReceived = 0;
-  let framesSent = 0;
+  let chunksSent = 0;
+  let chunksReceived = 0;
+  let bytesReceived = 0;
 
   ws.on("open", () => {
-    console.log("[2/3] WebSocket connected — streaming synthetic audio ...");
+    console.log("[2/3] WebSocket connected\n");
+
+    // Step 1: Send Smartflow handshake — "connected"
+    send(ws, { event: "connected" });
+    console.log("      → sent: connected");
+
+    // Step 2: Send "start" with stream metadata
+    send(ws, {
+      event: "start",
+      sequenceNumber: "1",
+      streamSid: STREAM_SID,
+      start: {
+        streamSid: STREAM_SID,
+        accountSid: ACCOUNT_SID,
+        callSid: CALL_SID,
+        from: MOCK_CALL.fromNumber,
+        to: MOCK_CALL.toNumber,
+        direction: "inbound",
+        mediaFormat: {
+          encoding: "audio/x-mulaw",
+          sampleRate: 8000,
+          bitRate: 64,
+          bitDepth: 8,
+        },
+      },
+    });
+    console.log("      → sent: start (stream metadata)");
     console.log(
-      `      Will run for ${CALL_DURATION_MS / 1000}s then hang up.\n`,
+      `      Will stream audio for ${CALL_DURATION_MS / 1000}s then hang up.\n`,
     );
 
+    // Step 3: Stream audio media events every 100ms (800-byte chunks = 100ms of 8kHz µ-law)
+    let seq = 2;
     audioInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(makeSilenceFrame());
-        framesSent++;
+        send(ws, {
+          event: "media",
+          sequenceNumber: String(seq++),
+          streamSid: STREAM_SID,
+          media: {
+            chunk: String(chunksSent + 1),
+            timestamp: String(chunksSent * 100),
+            payload: makeSilenceChunk(),
+          },
+        });
+        chunksSent++;
       }
-    }, AUDIO_SEND_INTERVAL_MS);
+    }, AUDIO_SEND_INTERVAL);
 
+    // Step 4: After CALL_DURATION_MS send "stop"
     setTimeout(() => {
-      console.log("\n[3/3] Simulating hang-up ...");
+      console.log("\n[3/3] Simulating hang-up (stop event) ...");
       if (audioInterval) clearInterval(audioInterval);
-      ws.close(1000, "call ended");
+      if (ws.readyState === WebSocket.OPEN) {
+        send(ws, {
+          event: "stop",
+          sequenceNumber: String(chunksSent + 2),
+          streamSid: STREAM_SID,
+          stop: {
+            accountSid: ACCOUNT_SID,
+            callSid: CALL_SID,
+            reason: "The caller disconnected the call",
+          },
+        });
+        ws.close(1000, "call ended");
+      }
     }, CALL_DURATION_MS);
   });
 
-  ws.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
-    if (isBinary) {
-      framesReceived++;
-      if (framesReceived === 1) {
-        console.log(
-          "      ✅ First audio frame received from Retell AI agent!",
-        );
+  ws.on("message", (data: WebSocket.RawData) => {
+    const text = data.toString();
+    try {
+      const msg = JSON.parse(text) as {
+        event: string;
+        media?: { payload: string };
+        streamSid?: string;
+      };
+
+      if (msg.event === "media" && msg.media?.payload) {
+        const audioBuf = Buffer.from(msg.media.payload, "base64");
+        chunksReceived++;
+        bytesReceived += audioBuf.length;
+
+        if (chunksReceived === 1) {
+          console.log(
+            `      ✅ First agent audio chunk received! (${audioBuf.length} bytes decoded)`,
+          );
+        }
+        if (chunksReceived % 10 === 0) {
+          console.log(
+            `      ← agent audio: ${chunksReceived} chunks  ${(bytesReceived / 1024).toFixed(1)} KB total`,
+          );
+        }
+      } else if (msg.event === "clear") {
+        console.log("      ← clear (barge-in from agent)");
+      } else {
+        console.log(`      ← event: ${msg.event}`);
       }
-      if (framesReceived % 50 === 0) {
-        const buf = data as Buffer;
-        console.log(
-          `      ← agent audio: ${framesReceived} frames received (last frame ${buf.length} bytes)`,
-        );
-      }
-    } else {
-      console.log(`      ← text frame: ${data.toString()}`);
+    } catch {
+      console.log(`      ← non-JSON frame: ${text.slice(0, 80)}`);
     }
   });
 
   ws.on("close", (code, reason) => {
     if (audioInterval) clearInterval(audioInterval);
-    console.log(`\n=== Call ended ===`);
-    console.log(`  Close code   : ${code}`);
-    console.log(`  Reason       : ${reason.toString() || "(none)"}`);
+    console.log("\n=== Call ended ===");
+    console.log(`  Close code      : ${code}`);
+    console.log(`  Reason          : ${reason.toString() || "(none)"}`);
     console.log(
-      `  Frames sent  : ${framesSent}  (~${((framesSent * AUDIO_FRAME_BYTES) / 1024).toFixed(1)} KB)`,
+      `  Chunks sent     : ${chunksSent}  (~${((chunksSent * AUDIO_CHUNK_BYTES) / 1024).toFixed(1)} KB)`,
     );
-    console.log(`  Frames recv  : ${framesReceived}`);
+    console.log(
+      `  Chunks received : ${chunksReceived}  (~${(bytesReceived / 1024).toFixed(1)} KB)`,
+    );
+    if (chunksReceived === 0) {
+      console.log(
+        "\n  ⚠️  No agent audio received — check Retell API key/agent config and server logs",
+      );
+    }
   });
 
   ws.on("error", (err: Error) => {
