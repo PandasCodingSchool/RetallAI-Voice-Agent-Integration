@@ -1,0 +1,29 @@
+{
+  "name": "retallai-smartflow-bridge",
+  "version": "1.0.0",
+  "description": "Node.js middleware bridging Tata Smartflow audio stream to Retell AI voice agent",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "nodemon --exec ts-node src/server.ts",
+    "lint": "tsc --noEmit",
+    "simulate": "ts-node test/simulate-smartflow.ts"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "uuid": "^10.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.9",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.5.11",
+    "nodemon": "^3.1.4",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.3"
+  }
+}
