@@ -3,6 +3,7 @@ import http from "http";
 import url from "url";
 import { getSession, deleteSession } from "../utils/sessionStore";
 import { logger } from "../utils/logger";
+import { getAdapter } from "../adapters";
 
 const RETELL_WS_BASE = "wss://api.retellai.com/audio-websocket";
 
@@ -29,18 +30,21 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     }
 
     session.smartflowWs = smartflowWs;
+    const adapter = getAdapter(session.vendor);
+    let streamSid = "";
+    let chunkCounter = 0;
+    let cleanupCalled = false;
 
-    logger.info("Smartflow WebSocket connected", {
+    logger.info("Vendor WebSocket connected", {
       token,
+      vendor: session.vendor,
       smartflowCallId: session.smartflowCallId,
       retellCallId: session.retellCallId,
     });
 
     const retellWsUrl = `${RETELL_WS_BASE}/${session.retellCallId}`;
     const retellWs = new WebSocket(retellWsUrl, {
-      headers: {
-        Authorization: `Bearer ${session.retellAccessToken}`,
-      },
+      headers: { Authorization: `Bearer ${session.retellAccessToken}` },
     });
     session.retellWs = retellWs;
 
@@ -48,43 +52,104 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
       logger.info("Retell WebSocket connected", {
         retellCallId: session.retellCallId,
       });
+      if (adapter.onOpen) {
+        adapter.onOpen(smartflowWs, { streamSid, chunkCounter });
+      }
     });
 
-    smartflowWs.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
-      if (retellWs.readyState === WebSocket.OPEN) {
-        retellWs.send(data, { binary: isBinary });
+    smartflowWs.on("message", (raw: WebSocket.RawData) => {
+      const event = adapter.decode(raw);
+      if (!event) return;
+
+      switch (event.type) {
+        case "connected":
+          logger.info("Vendor stream connected handshake", {
+            token,
+            vendor: session.vendor,
+          });
+          break;
+
+        case "start":
+          streamSid = event.streamSid;
+          logger.info("Vendor stream started", {
+            vendor: session.vendor,
+            streamSid,
+            from: event.from,
+            to: event.to,
+          });
+          break;
+
+        case "audio":
+          if (retellWs.readyState === WebSocket.OPEN) {
+            retellWs.send(event.payload, { binary: true });
+          }
+          break;
+
+        case "stop":
+          logger.info("Vendor stream stop event", {
+            vendor: session.vendor,
+            streamSid,
+          });
+          cleanup("vendor-stop");
+          break;
       }
     });
 
     retellWs.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
       if (isBinary) {
-        if (smartflowWs.readyState === WebSocket.OPEN) {
-          smartflowWs.send(data, { binary: true });
+        if (smartflowWs.readyState !== WebSocket.OPEN) return;
+
+        const audioBuf =
+          data instanceof Buffer ? data : Buffer.from(data as ArrayBuffer);
+        chunkCounter++;
+
+        const frame = adapter.encodeAudio(audioBuf, {
+          streamSid,
+          chunkCounter,
+        });
+        smartflowWs.send(frame);
+
+        if (chunkCounter === 1) {
+          logger.info("First agent audio frame sent to vendor", {
+            vendor: session.vendor,
+            retellCallId: session.retellCallId,
+            bytes: audioBuf.length,
+          });
         }
       } else {
         const text = data.toString();
         try {
           const parsed = JSON.parse(text) as { content?: string };
           if (parsed.content === "clear") {
-            logger.debug("Retell barge-in/clear signal received", {
+            logger.info("Retell barge-in clear — forwarding to vendor", {
+              vendor: session.vendor,
               retellCallId: session.retellCallId,
             });
+            const clearFrame = adapter.encodeClear({ streamSid, chunkCounter });
+            if (
+              clearFrame !== null &&
+              smartflowWs.readyState === WebSocket.OPEN
+            ) {
+              smartflowWs.send(clearFrame);
+            }
           }
         } catch {
-          logger.debug("Retell text frame (non-JSON)", {
-            retellCallId: session.retellCallId,
-            text,
-          });
+          logger.debug("Retell text frame (non-JSON)", { text });
         }
       }
     });
 
     const cleanup = (source: string) => {
+      if (cleanupCalled) return;
+      cleanupCalled = true;
+
       logger.info("Call session ending", {
         source,
+        vendor: session.vendor,
         token,
         smartflowCallId: session.smartflowCallId,
         retellCallId: session.retellCallId,
+        chunksSentToVendor: chunkCounter,
       });
 
       if (
