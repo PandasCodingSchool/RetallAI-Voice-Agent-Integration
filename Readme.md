@@ -37,15 +37,21 @@ wss://api.retellai.com/audio-websocket/{call_id}
 src/
   server.ts                 # Express + HTTP server, static files
   config.ts                 # Env var loader (strips protocol prefix from SERVER_WSS_HOST)
+  adapters/
+    types.ts                # IVendorAdapter interface + NormalisedEvent union type
+    index.ts                # getAdapter(vendor) registry
+    smartflow.ts            # Tata Smartflow — JSON+base64 µ-law 8kHz
+    twilio.ts               # Twilio Media Streams — JSON+base64 µ-law 8kHz
+    generic.ts              # Raw binary µ-law — for custom/direct integrations
   routes/
-    voiceEndpoint.ts        # POST /voice/endpoint  — Dynamic Endpoint for Smartflow
-    createWebCall.ts        # POST /create-web-call — issues Retell access_token for browser test
+    voiceEndpoint.ts        # POST /voice/endpoint?vendor=  — Dynamic Endpoint
+    createWebCall.ts        # POST /create-web-call — Retell access_token for browser test
   ws/
-    bridge.ts               # JSON↔binary protocol translation + bidirectional audio proxy
+    bridge.ts               # Adapter-driven bidirectional audio proxy
   services/
     retellService.ts        # Retell AI REST API (register call)
   utils/
-    sessionStore.ts         # In-memory Map with TTL cleanup
+    sessionStore.ts         # In-memory Map with TTL cleanup (stores vendor per session)
     logger.ts               # Structured JSON logger (CloudWatch-ready)
 public/
   test-call.html            # Browser-based live call tester (uses official Retell SDK)
@@ -219,6 +225,65 @@ In Smartflow → Voice Streaming → Dynamic Endpoint:
 | Response field | `wss_url`                                  |
 
 Smartflow will POST `callId`, `fromNumber`, `toNumber`, `status` and use the returned `wss_url` to open the audio stream.
+
+## Multi-Vendor Support
+
+The bridge is vendor-agnostic. Each vendor has a thin adapter in `src/adapters/` that normalises its protocol to a common internal format. The Retell AI connection is identical for all vendors.
+
+### Using a different vendor
+
+Pass `?vendor=<name>` on the Dynamic Endpoint call:
+
+```bash
+# Twilio
+POST /voice/endpoint?vendor=twilio
+
+# Tata Smartflow (default — no param needed)
+POST /voice/endpoint?vendor=smartflow
+
+# Raw binary µ-law stream
+POST /voice/endpoint?vendor=generic
+```
+
+### Supported vendors
+
+| Vendor               | `?vendor=`            | Audio format      | Protocol                             |
+| -------------------- | --------------------- | ----------------- | ------------------------------------ |
+| Tata Smartflow       | `smartflow` (default) | µ-law 8kHz base64 | JSON text frames (Twilio-compatible) |
+| Twilio Media Streams | `twilio`              | µ-law 8kHz base64 | JSON text frames                     |
+| Generic / custom     | `generic`             | µ-law 8kHz raw    | Raw binary WebSocket frames          |
+
+### Adding a new vendor
+
+1. Create `src/adapters/<vendor>.ts` implementing `IVendorAdapter`:
+
+```ts
+import { IVendorAdapter, NormalisedEvent, AdapterContext } from "./types";
+
+export class MyVendorAdapter implements IVendorAdapter {
+  readonly vendor = "myvendor" as const;
+
+  decode(raw: WebSocket.RawData): NormalisedEvent | null {
+    /* parse vendor frames */
+  }
+  encodeAudio(payload: Buffer, ctx: AdapterContext): string | Buffer {
+    /* wrap for vendor */
+  }
+  encodeClear(ctx: AdapterContext): string | Buffer | null {
+    /* barge-in signal or null */
+  }
+}
+```
+
+2. Register it in `src/adapters/index.ts`:
+
+```ts
+myvendor: () => new MyVendorAdapter(),
+```
+
+3. Add `"myvendor"` to the `VendorName` union in `src/adapters/types.ts`.
+
+That's it — no changes to the bridge, session store, or routes.
 
 ## Environment Variables
 

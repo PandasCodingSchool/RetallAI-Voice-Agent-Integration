@@ -35,10 +35,6 @@
         {
           "name": "RETELL_AGENT_ID",
           "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:retallai/agent-id"
-        },
-        {
-          "name": "SERVER_WSS_HOST",
-          "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:retallai/server-wss-host"
         }
       ],
       "logConfiguration": {
