@@ -18,7 +18,7 @@ export async function registerCall(
   toNumber: string,
   smartflowCallId: string,
 ): Promise<RegisterCallResponse> {
-  const url = `${RETELL_API_BASE}/register-call`;
+  const url = `${RETELL_API_BASE}/v2/register-call`;
 
   const payload = {
     agent_id: config.retellAgentId,
@@ -42,13 +42,27 @@ export async function registerCall(
     sampleRate: payload.sample_rate,
   });
 
-  const response = await axios.post<RegisterCallResponse>(url, payload, {
-    headers: {
-      Authorization: `Bearer ${config.retellApiKey}`,
-      "Content-Type": "application/json",
-    },
-    timeout: 5000,
-  });
+  let response;
+  try {
+    response = await axios.post<RegisterCallResponse>(url, payload, {
+      headers: {
+        Authorization: `Bearer ${config.retellApiKey}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 5000,
+    });
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      logger.error("Retell call registration failed", {
+        smartflowCallId,
+        url,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        responseData: error.response?.data,
+      });
+    }
+    throw error;
+  }
 
   logger.info("Retell call registered", {
     smartflowCallId,
