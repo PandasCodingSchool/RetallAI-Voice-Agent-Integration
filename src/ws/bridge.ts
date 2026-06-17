@@ -34,7 +34,7 @@ function handleSmartflowStaticWs(
   let retellWs: WebSocket | null = null;
   let initialising = false; // registerCall in-flight guard
   let retellReady = false; // true once retellWs "open" fires
-  const audioBuffer: Buffer[] = []; // frames buffered before Retell opens
+  const audioBuffer: string[] = []; // Smartflow JSON media frames buffered before Retell opens
 
   let streamSid = "";
   let chunkCounter = 0;
@@ -102,20 +102,20 @@ function handleSmartflowStaticWs(
       retellWs.on("open", () => {
         retellReady = true;
         const bufferedBytes = audioBuffer.reduce(
-          (sum, buf) => sum + buf.length,
+          (sum, frame) => sum + Buffer.byteLength(frame),
           0,
         );
         logger.info("[static-ws] Retell WebSocket connected", {
           retellCallId: retellCall.call_id,
           bufferedFrames: audioBuffer.length,
           bufferedBytes,
-          audioFormat: "linear16_pcm_16khz_s16le",
+          audioProtocol: "twilio_json_media_mulaw_8khz",
         });
         const flushBufferedAudio = () => {
           if (!retellWs || retellWs.readyState !== WebSocket.OPEN) return;
-          const buf = audioBuffer.shift();
-          if (!buf) return;
-          retellWs.send(buf, { binary: true }, (err) => {
+          const frame = audioBuffer.shift();
+          if (!frame) return;
+          retellWs.send(frame, (err) => {
             if (err) {
               logger.error(
                 "[static-ws] Failed to send buffered frame to Retell",
@@ -130,10 +130,11 @@ function handleSmartflowStaticWs(
           });
         };
         if (audioBuffer.length > 0) {
-          logger.info("[static-ws] Flushing buffered audio frames to Retell", {
+          logger.info("[static-ws] Flushing buffered media frames to Retell", {
             count: audioBuffer.length,
             bytes: bufferedBytes,
             intervalMs: 20,
+            audioProtocol: "twilio_json_media_mulaw_8khz",
           });
           flushBufferedAudio();
         }
@@ -165,8 +166,26 @@ function handleSmartflowStaticWs(
           const text = data.toString();
           logger.debug("[static-ws] Retell text frame", { text });
           try {
-            const parsed = JSON.parse(text) as { content?: string };
-            if (parsed.content === "clear") {
+            const parsed = JSON.parse(text) as {
+              event?: string;
+              content?: string;
+            };
+            if (parsed.event === "media") {
+              if (smartflowWs.readyState === WebSocket.OPEN) {
+                smartflowWs.send(text);
+                chunkCounter++;
+                if (chunkCounter === 1) {
+                  logger.info(
+                    "[static-ws] First agent media frame sent to Smartflow",
+                    {
+                      retellCallId: retellCall.call_id,
+                    },
+                  );
+                }
+              }
+              return;
+            }
+            if (parsed.event === "clear" || parsed.content === "clear") {
               logger.info("[static-ws] Retell barge-in clear — forwarding");
               const clearFrame = adapter.encodeClear({
                 streamSid,
@@ -266,28 +285,27 @@ function handleSmartflowStaticWs(
           }
         }
         {
-          // Transcode µ-law 8kHz → linear-16 16kHz before forwarding to Retell
-          const pcmBuf = mulawToLinear16x2(normEvent.payload);
+          // Retell register-phone-call expects Twilio-style JSON media frames.
           if (!retellWs || !retellReady) {
             // Buffer until Retell WS opens
-            audioBuffer.push(pcmBuf);
+            audioBuffer.push(rawStr);
             logger.debug(
-              "[static-ws] Buffered audio frame (Retell not ready)",
+              "[static-ws] Buffered media frame (Retell not ready)",
               {
                 bufferedCount: audioBuffer.length,
                 mulawBytes: normEvent.payload.length,
-                pcmBytes: pcmBuf.length,
-                audioFormat: "linear16_pcm_16khz_s16le",
+                jsonBytes: Buffer.byteLength(rawStr),
+                audioProtocol: "twilio_json_media_mulaw_8khz",
               },
             );
-          } else {
-            retellWs.send(pcmBuf, { binary: true }, (err) => {
+          } else if (retellWs.readyState === WebSocket.OPEN) {
+            retellWs.send(rawStr, (err) => {
               if (err) {
                 logger.error(
-                  "[static-ws] Failed to send live audio frame to Retell",
+                  "[static-ws] Failed to send live media frame to Retell",
                   {
                     error: err.message,
-                    pcmBytes: pcmBuf.length,
+                    jsonBytes: Buffer.byteLength(rawStr),
                   },
                 );
               }
