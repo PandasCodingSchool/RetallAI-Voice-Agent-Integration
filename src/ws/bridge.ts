@@ -101,20 +101,42 @@ function handleSmartflowStaticWs(
 
       retellWs.on("open", () => {
         retellReady = true;
+        const bufferedBytes = audioBuffer.reduce(
+          (sum, buf) => sum + buf.length,
+          0,
+        );
         logger.info("[static-ws] Retell WebSocket connected", {
           retellCallId: retellCall.call_id,
           bufferedFrames: audioBuffer.length,
+          bufferedBytes,
+          audioFormat: "linear16_pcm_16khz_s16le",
         });
-        // Flush any audio frames that arrived while we were connecting
-        for (const buf of audioBuffer) {
-          retellWs!.send(buf, { binary: true });
-        }
-        if (audioBuffer.length > 0) {
-          logger.info("[static-ws] Flushed buffered audio frames to Retell", {
-            count: audioBuffer.length,
+        const flushBufferedAudio = () => {
+          if (!retellWs || retellWs.readyState !== WebSocket.OPEN) return;
+          const buf = audioBuffer.shift();
+          if (!buf) return;
+          retellWs.send(buf, { binary: true }, (err) => {
+            if (err) {
+              logger.error(
+                "[static-ws] Failed to send buffered frame to Retell",
+                {
+                  retellCallId: retellCall.call_id,
+                  error: err.message,
+                },
+              );
+              return;
+            }
+            setTimeout(flushBufferedAudio, 20);
           });
+        };
+        if (audioBuffer.length > 0) {
+          logger.info("[static-ws] Flushing buffered audio frames to Retell", {
+            count: audioBuffer.length,
+            bytes: bufferedBytes,
+            intervalMs: 20,
+          });
+          flushBufferedAudio();
         }
-        audioBuffer.length = 0;
       });
 
       retellWs.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
@@ -253,10 +275,23 @@ function handleSmartflowStaticWs(
               "[static-ws] Buffered audio frame (Retell not ready)",
               {
                 bufferedCount: audioBuffer.length,
+                mulawBytes: normEvent.payload.length,
+                pcmBytes: pcmBuf.length,
+                audioFormat: "linear16_pcm_16khz_s16le",
               },
             );
           } else {
-            retellWs.send(pcmBuf, { binary: true });
+            retellWs.send(pcmBuf, { binary: true }, (err) => {
+              if (err) {
+                logger.error(
+                  "[static-ws] Failed to send live audio frame to Retell",
+                  {
+                    error: err.message,
+                    pcmBytes: pcmBuf.length,
+                  },
+                );
+              }
+            });
           }
         }
         break;
