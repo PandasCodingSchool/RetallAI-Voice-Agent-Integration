@@ -1,8 +1,8 @@
-import axios from 'axios';
-import { config } from '../config';
-import { logger } from '../utils/logger';
+import axios from "axios";
+import { config } from "../config";
+import { logger } from "../utils/logger";
 
-const RETELL_API_BASE = 'https://api.retellai.com';
+const RETELL_API_BASE = "https://api.retellai.com";
 
 export interface RegisterCallResponse {
   call_id: string;
@@ -14,28 +14,36 @@ export async function registerCall(
   toNumber: string,
   smartflowCallId: string,
 ): Promise<RegisterCallResponse> {
-  const url = `${RETELL_API_BASE}/v2/create-web-call`;
+  const url = `${RETELL_API_BASE}/v2/register-call`;
 
   const payload = {
     agent_id: config.retellAgentId,
+    audio_websocket_protocol: "web",
+    audio_encoding: "mulaw",
+    sample_rate: 8000,
+    from_number: fromNumber,
+    to_number: toNumber,
     metadata: {
       smartflow_call_id: smartflowCallId,
-      from_number: fromNumber,
-      to_number: toNumber,
     },
   };
 
-  logger.info('Registering call with Retell AI', { smartflowCallId, fromNumber, toNumber });
+  logger.info("Registering call with Retell AI", {
+    smartflowCallId,
+    fromNumber,
+    toNumber,
+    url,
+  });
 
   const response = await axios.post<RegisterCallResponse>(url, payload, {
     headers: {
       Authorization: `Bearer ${config.retellApiKey}`,
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
     },
     timeout: 5000,
   });
 
-  logger.info('Retell call registered', {
+  logger.info("Retell call registered", {
     smartflowCallId,
     retellCallId: response.data.call_id,
   });
