@@ -64,36 +64,21 @@ function handleSmartflowStaticWs(
     }
   };
 
-  // ── Initialise Retell connection (called once on first message) ────────────
+  // ── Initialise Retell connection (called once we have real phone numbers) ──
   async function initialise(
-    firstFrame: Record<string, unknown>,
+    fromNumber: string,
+    toNumber: string,
+    sid: string,
   ): Promise<void> {
     if (initialising) return;
     initialising = true;
 
-    // Extract metadata from the first frame where available
-    const event = firstFrame["event"] as string | undefined;
-    const rtpIp = firstFrame["rtpIp"] as string | undefined;
-    const rtpHostName = firstFrame["rtpHostName"] as string | undefined;
-    const rtpPort = firstFrame["rtpPort"] as string | undefined;
-
-    // Grab streamSid early if it's already in this frame
-    const frameSid =
-      (firstFrame["streamSid"] as string | undefined) ??
-      ((firstFrame["start"] as Record<string, unknown> | undefined)?.[
-        "streamSid"
-      ] as string | undefined);
-    if (frameSid) streamSid = frameSid;
-
+    streamSid = sid;
     callId = `sf-static-${uuidv4()}`;
-    const fromNumber = rtpIp ?? "static";
-    const toNumber = rtpHostName ?? "static";
 
-    logger.info("[static-ws] First message received — initialising Retell", {
-      event,
-      rtpIp,
-      rtpPort,
-      rtpHostName,
+    logger.info("[static-ws] Start event received — initialising Retell", {
+      fromNumber,
+      toNumber,
       streamSid,
       callId,
     });
@@ -218,12 +203,6 @@ function handleSmartflowStaticWs(
     const event = frame["event"] as string | undefined;
     logger.debug("[static-ws] Parsed event", { event });
 
-    // ── Trigger initialisation on the very first frame ─────────────────────
-    if (!initialising) {
-      await initialise(frame);
-      // If the first frame itself carries audio, fall through to handle it below
-    }
-
     // ── Route frame through the adapter ───────────────────────────────────
     const normEvent = adapter.decode(raw);
     if (!normEvent) return;
@@ -240,6 +219,14 @@ function handleSmartflowStaticWs(
           from: normEvent.from,
           to: normEvent.to,
         });
+        // ── Trigger Retell registration now that we have real phone numbers ──
+        if (!initialising) {
+          await initialise(
+            normEvent.from ?? "unknown",
+            normEvent.to ?? "unknown",
+            normEvent.streamSid,
+          );
+        }
         break;
 
       case "audio":
