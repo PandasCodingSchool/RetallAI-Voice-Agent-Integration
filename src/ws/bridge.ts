@@ -1,30 +1,308 @@
 import WebSocket, { WebSocketServer } from "ws";
 import http from "http";
 import url from "url";
+import { v4 as uuidv4 } from "uuid";
 import { getSession, deleteSession } from "../utils/sessionStore";
 import { logger } from "../utils/logger";
 import { getAdapter } from "../adapters";
+import { registerCall } from "../services/retellService";
 
 const RETELL_WS_BASE = "wss://api.retellai.com/audio-websocket";
 
+/**
+ * Handles Smartflow "static" endpoint mode:
+ * Smartflow upgrades the endpoint URL itself to a WebSocket and sends
+ * a JSON `connection` event with rtpIp/rtpPort instead of doing an HTTP POST.
+ * This function registers the call with Retell, then runs the same bridge logic.
+ */
+function handleSmartflowStaticWs(
+  smartflowWs: WebSocket,
+  req: http.IncomingMessage,
+): void {
+  const remoteIp = req.socket.remoteAddress ?? "unknown";
+  logger.info("[static-ws] Smartflow static WS connection received", {
+    remoteIp,
+    url: req.url,
+    headers: req.headers,
+  });
+
+  let initialised = false;
+  let streamSid = "";
+  let chunkCounter = 0;
+  let cleanupCalled = false;
+  let retellWs: WebSocket | null = null;
+
+  const cleanup = (source: string, callId?: string, retellCallId?: string) => {
+    if (cleanupCalled) return;
+    cleanupCalled = true;
+    logger.info("[static-ws] Call session ending", {
+      source,
+      callId,
+      retellCallId,
+      chunksSentToVendor: chunkCounter,
+    });
+    if (
+      smartflowWs.readyState === WebSocket.OPEN ||
+      smartflowWs.readyState === WebSocket.CONNECTING
+    ) {
+      smartflowWs.close();
+    }
+    if (
+      retellWs &&
+      (retellWs.readyState === WebSocket.OPEN ||
+        retellWs.readyState === WebSocket.CONNECTING)
+    ) {
+      retellWs.close();
+    }
+  };
+
+  smartflowWs.on("message", async (raw: WebSocket.RawData) => {
+    const rawStr = raw.toString();
+    logger.debug("[static-ws] Raw message from Smartflow", { raw: rawStr });
+
+    let frame: Record<string, unknown>;
+    try {
+      frame = JSON.parse(rawStr) as Record<string, unknown>;
+    } catch {
+      logger.warn("[static-ws] Non-JSON message from Smartflow", {
+        raw: rawStr,
+      });
+      return;
+    }
+
+    const event = frame["event"] as string | undefined;
+    logger.debug("[static-ws] Parsed event", { event, frame });
+
+    // ── First message: Smartflow static `connection` event ──────────────────
+    if (!initialised && event === "connection") {
+      const rtpIp = frame["rtpIp"] as string | undefined;
+      const rtpPort = frame["rtpPort"] as string | undefined;
+      const rtpHostName = frame["rtpHostName"] as string | undefined;
+
+      logger.info("[static-ws] Smartflow connection event received", {
+        rtpIp,
+        rtpPort,
+        rtpHostName,
+      });
+
+      // Synthesise placeholder call metadata (static mode has no from/to yet)
+      const callId = `sf-static-${uuidv4()}`;
+      const fromNumber = rtpIp ?? "unknown";
+      const toNumber = rtpHostName ?? "unknown";
+
+      try {
+        logger.info("[static-ws] Registering call with Retell AI", { callId });
+        const retellCall = await registerCall(fromNumber, toNumber, callId);
+        logger.info("[static-ws] Retell call registered", {
+          callId,
+          retellCallId: retellCall.call_id,
+        });
+
+        initialised = true;
+
+        // Build and open the Retell WS
+        const retellWsUrl = `${RETELL_WS_BASE}/${retellCall.call_id}`;
+        logger.info("[static-ws] Connecting to Retell WebSocket", {
+          retellWsUrl,
+        });
+        retellWs = new WebSocket(retellWsUrl, {
+          headers: { Authorization: `Bearer ${retellCall.access_token}` },
+        });
+
+        const adapter = getAdapter("smartflow");
+
+        retellWs.on("open", () => {
+          logger.info("[static-ws] Retell WebSocket connected", {
+            retellCallId: retellCall.call_id,
+          });
+        });
+
+        retellWs.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
+          if (isBinary) {
+            if (smartflowWs.readyState !== WebSocket.OPEN) return;
+            const audioBuf =
+              data instanceof Buffer ? data : Buffer.from(data as ArrayBuffer);
+            chunkCounter++;
+            const outFrame = adapter.encodeAudio(audioBuf, {
+              streamSid,
+              chunkCounter,
+            });
+            smartflowWs.send(outFrame);
+            if (chunkCounter === 1) {
+              logger.info(
+                "[static-ws] First agent audio frame sent to Smartflow",
+                {
+                  retellCallId: retellCall.call_id,
+                  bytes: audioBuf.length,
+                },
+              );
+            }
+          } else {
+            const text = data.toString();
+            logger.debug("[static-ws] Retell text frame", { text });
+            try {
+              const parsed = JSON.parse(text) as { content?: string };
+              if (parsed.content === "clear") {
+                logger.info("[static-ws] Retell barge-in clear — forwarding");
+                const clearFrame = adapter.encodeClear({
+                  streamSid,
+                  chunkCounter,
+                });
+                if (
+                  clearFrame !== null &&
+                  smartflowWs.readyState === WebSocket.OPEN
+                ) {
+                  smartflowWs.send(clearFrame);
+                }
+              }
+            } catch {
+              logger.debug("[static-ws] Retell non-JSON text frame", { text });
+            }
+          }
+        });
+
+        retellWs.on("close", (code, reason) => {
+          logger.info("[static-ws] Retell WebSocket closed", {
+            code,
+            reason: reason.toString(),
+            retellCallId: retellCall.call_id,
+          });
+          cleanup("retell", callId, retellCall.call_id);
+        });
+
+        retellWs.on("error", (err) => {
+          logger.error("[static-ws] Retell WebSocket error", {
+            retellCallId: retellCall.call_id,
+            error: err.message,
+          });
+          cleanup("retell-error", callId, retellCall.call_id);
+        });
+      } catch (err) {
+        logger.error("[static-ws] Failed to register call with Retell AI", {
+          callId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        smartflowWs.close(4003, "Retell registration failed");
+        return;
+      }
+      return;
+    }
+
+    // ── Subsequent messages: decode via smartflow adapter ───────────────────
+    if (!initialised) {
+      logger.warn("[static-ws] Message received before connection event", {
+        event,
+        frame,
+      });
+      return;
+    }
+    if (!retellWs) return;
+
+    const adapter = getAdapter("smartflow");
+    const normEvent = adapter.decode(raw);
+    if (!normEvent) return;
+
+    switch (normEvent.type) {
+      case "connected":
+        logger.info("[static-ws] Smartflow connected handshake");
+        break;
+
+      case "start":
+        streamSid = normEvent.streamSid;
+        logger.info("[static-ws] Smartflow stream started", {
+          streamSid,
+          from: normEvent.from,
+          to: normEvent.to,
+        });
+        break;
+
+      case "audio":
+        if (retellWs.readyState === WebSocket.OPEN) {
+          retellWs.send(normEvent.payload, { binary: true });
+        } else {
+          logger.warn("[static-ws] Retell WS not open, dropping audio frame", {
+            retellWsState: retellWs.readyState,
+          });
+        }
+        break;
+
+      case "stop":
+        logger.info("[static-ws] Smartflow stop event");
+        cleanup("vendor-stop");
+        break;
+    }
+  });
+
+  smartflowWs.on("close", (code, reason) => {
+    logger.info("[static-ws] Smartflow WebSocket closed", {
+      code,
+      reason: reason.toString(),
+    });
+    cleanup("smartflow");
+  });
+
+  smartflowWs.on("error", (err) => {
+    logger.error("[static-ws] Smartflow WebSocket error", {
+      error: err.message,
+    });
+    cleanup("smartflow-error");
+  });
+}
+
 export function attachWebSocketBridge(server: http.Server): WebSocketServer {
-  const wss = new WebSocketServer({ server, path: "/stream" });
+  // Single WS server handles both /stream and /voice/endpoint upgrades
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on("upgrade", (req: http.IncomingMessage, socket, head) => {
+    const parsedUrl = url.parse(req.url ?? "", true);
+    const pathname = parsedUrl.pathname ?? "";
+
+    logger.info("[upgrade] WebSocket upgrade request", {
+      pathname,
+      remoteAddress: (socket as import("net").Socket).remoteAddress,
+      headers: req.headers,
+    });
+
+    if (pathname === "/stream" || pathname === "/voice/endpoint") {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req);
+      });
+    } else {
+      logger.warn(
+        "[upgrade] Unhandled WebSocket upgrade path — destroying socket",
+        { pathname },
+      );
+      socket.destroy();
+    }
+  });
 
   wss.on("connection", (smartflowWs: WebSocket, req: http.IncomingMessage) => {
     const parsedUrl = url.parse(req.url ?? "", true);
     const token = parsedUrl.query["token"] as string | undefined;
 
+    logger.info("[bridge] WebSocket connection", {
+      path: parsedUrl.pathname,
+      token: token ?? "(none — static mode)",
+      remoteAddress: req.socket.remoteAddress,
+      url: req.url,
+    });
+
+    // No token → static mode: Smartflow connects directly to /stream or /voice/endpoint
+    // without a prior HTTP POST, and sends the connection event itself.
     if (!token) {
-      logger.warn("WebSocket connection rejected: missing token");
-      smartflowWs.close(4001, "Missing token");
+      logger.info("[bridge] No token — switching to static mode handler");
+      handleSmartflowStaticWs(smartflowWs, req);
       return;
     }
 
     const session = getSession(token);
     if (!session) {
-      logger.warn("WebSocket connection rejected: invalid or expired token", {
-        token,
-      });
+      logger.warn(
+        "[bridge] WebSocket connection rejected: invalid or expired token",
+        {
+          token,
+        },
+      );
       smartflowWs.close(4002, "Invalid or expired token");
       return;
     }
@@ -35,7 +313,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     let chunkCounter = 0;
     let cleanupCalled = false;
 
-    logger.info("Vendor WebSocket connected", {
+    logger.info("[bridge] Vendor WebSocket connected", {
       token,
       vendor: session.vendor,
       smartflowCallId: session.smartflowCallId,
@@ -49,7 +327,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     session.retellWs = retellWs;
 
     retellWs.on("open", () => {
-      logger.info("Retell WebSocket connected", {
+      logger.info("[bridge] Retell WebSocket connected", {
         retellCallId: session.retellCallId,
       });
       if (adapter.onOpen) {
@@ -63,7 +341,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
 
       switch (event.type) {
         case "connected":
-          logger.info("Vendor stream connected handshake", {
+          logger.info("[bridge] Vendor stream connected handshake", {
             token,
             vendor: session.vendor,
           });
@@ -71,7 +349,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
 
         case "start":
           streamSid = event.streamSid;
-          logger.info("Vendor stream started", {
+          logger.info("[bridge] Vendor stream started", {
             vendor: session.vendor,
             streamSid,
             from: event.from,
@@ -82,11 +360,16 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
         case "audio":
           if (retellWs.readyState === WebSocket.OPEN) {
             retellWs.send(event.payload, { binary: true });
+          } else {
+            logger.warn("[bridge] Retell WS not open, dropping audio frame", {
+              retellWsState: retellWs.readyState,
+              vendor: session.vendor,
+            });
           }
           break;
 
         case "stop":
-          logger.info("Vendor stream stop event", {
+          logger.info("[bridge] Vendor stream stop event", {
             vendor: session.vendor,
             streamSid,
           });
@@ -110,7 +393,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
         smartflowWs.send(frame);
 
         if (chunkCounter === 1) {
-          logger.info("First agent audio frame sent to vendor", {
+          logger.info("[bridge] First agent audio frame sent to vendor", {
             vendor: session.vendor,
             retellCallId: session.retellCallId,
             bytes: audioBuf.length,
@@ -121,10 +404,13 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
         try {
           const parsed = JSON.parse(text) as { content?: string };
           if (parsed.content === "clear") {
-            logger.info("Retell barge-in clear — forwarding to vendor", {
-              vendor: session.vendor,
-              retellCallId: session.retellCallId,
-            });
+            logger.info(
+              "[bridge] Retell barge-in clear — forwarding to vendor",
+              {
+                vendor: session.vendor,
+                retellCallId: session.retellCallId,
+              },
+            );
             const clearFrame = adapter.encodeClear({ streamSid, chunkCounter });
             if (
               clearFrame !== null &&
@@ -134,7 +420,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
             }
           }
         } catch {
-          logger.debug("Retell text frame (non-JSON)", { text });
+          logger.debug("[bridge] Retell non-JSON text frame", { text });
         }
       }
     });
@@ -143,7 +429,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
       if (cleanupCalled) return;
       cleanupCalled = true;
 
-      logger.info("Call session ending", {
+      logger.info("[bridge] Call session ending", {
         source,
         vendor: session.vendor,
         token,
@@ -169,7 +455,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     };
 
     smartflowWs.on("close", (code: number, reason: Buffer) => {
-      logger.info("Smartflow WebSocket closed", {
+      logger.info("[bridge] Smartflow WebSocket closed", {
         code,
         reason: reason.toString(),
         smartflowCallId: session.smartflowCallId,
@@ -178,7 +464,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     });
 
     retellWs.on("close", (code: number, reason: Buffer) => {
-      logger.info("Retell WebSocket closed", {
+      logger.info("[bridge] Retell WebSocket closed", {
         code,
         reason: reason.toString(),
         retellCallId: session.retellCallId,
@@ -187,7 +473,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     });
 
     smartflowWs.on("error", (err: Error) => {
-      logger.error("Smartflow WebSocket error", {
+      logger.error("[bridge] Smartflow WebSocket error", {
         smartflowCallId: session.smartflowCallId,
         error: err.message,
       });
@@ -195,7 +481,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     });
 
     retellWs.on("error", (err: Error) => {
-      logger.error("Retell WebSocket error", {
+      logger.error("[bridge] Retell WebSocket error", {
         retellCallId: session.retellCallId,
         error: err.message,
       });
@@ -203,6 +489,8 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     });
   });
 
-  logger.info("WebSocket bridge attached at /stream");
+  logger.info("WebSocket bridge attached", {
+    paths: ["/stream", "/voice/endpoint (static)"],
+  });
   return wss;
 }
