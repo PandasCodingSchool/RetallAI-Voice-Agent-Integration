@@ -6,6 +6,7 @@ import { getSession, deleteSession } from "../utils/sessionStore";
 import { logger } from "../utils/logger";
 import { getAdapter } from "../adapters";
 import { registerCall } from "../services/retellService";
+import { mulawToLinear16x2, linear16x2ToMulaw } from "../utils/audioTranscode";
 
 const RETELL_WS_BASE = "wss://api.retellai.com/audio-websocket";
 
@@ -119,8 +120,10 @@ function handleSmartflowStaticWs(
       retellWs.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
         if (isBinary) {
           if (smartflowWs.readyState !== WebSocket.OPEN) return;
-          const audioBuf =
+          const pcmBuf =
             data instanceof Buffer ? data : Buffer.from(data as ArrayBuffer);
+          // Transcode linear-16 16kHz → µ-law 8kHz before sending back to Smartflow
+          const audioBuf = linear16x2ToMulaw(pcmBuf);
           chunkCounter++;
           const outFrame = adapter.encodeAudio(audioBuf, {
             streamSid,
@@ -240,14 +243,21 @@ function handleSmartflowStaticWs(
             });
           }
         }
-        if (!retellWs || !retellReady) {
-          // Buffer until Retell WS opens
-          audioBuffer.push(normEvent.payload);
-          logger.debug("[static-ws] Buffered audio frame (Retell not ready)", {
-            bufferedCount: audioBuffer.length,
-          });
-        } else {
-          retellWs.send(normEvent.payload, { binary: true });
+        {
+          // Transcode µ-law 8kHz → linear-16 16kHz before forwarding to Retell
+          const pcmBuf = mulawToLinear16x2(normEvent.payload);
+          if (!retellWs || !retellReady) {
+            // Buffer until Retell WS opens
+            audioBuffer.push(pcmBuf);
+            logger.debug(
+              "[static-ws] Buffered audio frame (Retell not ready)",
+              {
+                bufferedCount: audioBuffer.length,
+              },
+            );
+          } else {
+            retellWs.send(pcmBuf, { binary: true });
+          }
         }
         break;
 
@@ -382,9 +392,10 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
           });
           break;
 
-        case "audio":
+        case "audio": {
+          const pcmPayload = mulawToLinear16x2(event.payload);
           if (retellWs.readyState === WebSocket.OPEN) {
-            retellWs.send(event.payload, { binary: true });
+            retellWs.send(pcmPayload, { binary: true });
           } else {
             logger.warn("[bridge] Retell WS not open, dropping audio frame", {
               retellWsState: retellWs.readyState,
@@ -392,6 +403,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
             });
           }
           break;
+        }
 
         case "stop":
           logger.info("[bridge] Vendor stream stop event", {
@@ -407,8 +419,10 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
       if (isBinary) {
         if (smartflowWs.readyState !== WebSocket.OPEN) return;
 
-        const audioBuf =
+        const pcmBuf =
           data instanceof Buffer ? data : Buffer.from(data as ArrayBuffer);
+        // Transcode linear-16 16kHz → µ-law 8kHz before sending back to vendor
+        const audioBuf = linear16x2ToMulaw(pcmBuf);
         chunkCounter++;
 
         const frame = adapter.encodeAudio(audioBuf, {
