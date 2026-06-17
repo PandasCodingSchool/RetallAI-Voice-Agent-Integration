@@ -34,12 +34,89 @@ function handleSmartflowStaticWs(
   let retellWs: WebSocket | null = null;
   let initialising = false; // registerCall in-flight guard
   let retellReady = false; // true once retellWs "open" fires
-  const audioBuffer: string[] = []; // Smartflow JSON media frames buffered before Retell opens
+  const audioBuffer: string[] = []; // Twilio-style frames buffered before Retell opens
 
   let streamSid = "";
   let chunkCounter = 0;
   let cleanupCalled = false;
   let callId = "";
+
+  const makeRetellFrame = (frame: Record<string, unknown>): string | null => {
+    const event = frame["event"] as string | undefined;
+    const sequenceNumber = frame["sequenceNumber"];
+    const streamSidValue = frame["streamSid"] as string | undefined;
+
+    if (event === "connected") {
+      return JSON.stringify({ event: "connected" });
+    }
+
+    if (event === "start") {
+      const start = frame["start"] as Record<string, unknown> | undefined;
+      const mediaFormat = start?.["mediaFormat"] as
+        | Record<string, unknown>
+        | undefined;
+      return JSON.stringify({
+        event: "start",
+        sequenceNumber: String(sequenceNumber ?? "1"),
+        streamSid: streamSidValue ?? start?.["streamSid"] ?? streamSid,
+        start: {
+          ...start,
+          streamSid: start?.["streamSid"] ?? streamSidValue ?? streamSid,
+          mediaFormat: {
+            ...mediaFormat,
+            encoding: mediaFormat?.["encoding"] ?? "audio/x-mulaw",
+            sampleRate: mediaFormat?.["sampleRate"] ?? 8000,
+            channels: mediaFormat?.["channels"] ?? 1,
+          },
+        },
+      });
+    }
+
+    if (event === "media") {
+      const media = frame["media"] as Record<string, unknown> | undefined;
+      if (typeof media?.["payload"] !== "string") return null;
+      return JSON.stringify({
+        event: "media",
+        sequenceNumber: String(sequenceNumber ?? ""),
+        streamSid: streamSidValue ?? streamSid,
+        media: {
+          track: media["track"] ?? "inbound",
+          chunk: String(media["chunk"] ?? ""),
+          timestamp: String(media["timestamp"] ?? ""),
+          payload: media["payload"],
+        },
+      });
+    }
+
+    return null;
+  };
+
+  const sendOrBufferRetellFrame = (
+    frame: string,
+    details: Record<string, unknown>,
+  ): void => {
+    if (!retellWs || !retellReady) {
+      audioBuffer.push(frame);
+      logger.debug("[static-ws] Buffered frame for Retell", {
+        bufferedCount: audioBuffer.length,
+        jsonBytes: Buffer.byteLength(frame),
+        ...details,
+      });
+      return;
+    }
+
+    if (retellWs.readyState === WebSocket.OPEN) {
+      retellWs.send(frame, (err) => {
+        if (err) {
+          logger.error("[static-ws] Failed to send frame to Retell", {
+            error: err.message,
+            jsonBytes: Buffer.byteLength(frame),
+            ...details,
+          });
+        }
+      });
+    }
+  };
 
   const cleanup = (source: string, retellCallId?: string) => {
     if (cleanupCalled) return;
@@ -254,6 +331,15 @@ function handleSmartflowStaticWs(
     switch (normEvent.type) {
       case "connected":
         logger.info("[static-ws] Smartflow connected handshake");
+        {
+          const retellFrame = makeRetellFrame(frame);
+          if (retellFrame) {
+            sendOrBufferRetellFrame(retellFrame, {
+              event: "connected",
+              audioProtocol: "twilio_json_media_mulaw_8khz",
+            });
+          }
+        }
         break;
 
       case "start":
@@ -263,6 +349,15 @@ function handleSmartflowStaticWs(
           from: normEvent.from,
           to: normEvent.to,
         });
+        {
+          const retellFrame = makeRetellFrame(frame);
+          if (retellFrame) {
+            sendOrBufferRetellFrame(retellFrame, {
+              event: "start",
+              audioProtocol: "twilio_json_media_mulaw_8khz",
+            });
+          }
+        }
         // ── Trigger Retell registration now that we have real phone numbers ──
         if (!initialising) {
           await initialise(
@@ -285,30 +380,12 @@ function handleSmartflowStaticWs(
           }
         }
         {
-          // Retell register-phone-call expects Twilio-style JSON media frames.
-          if (!retellWs || !retellReady) {
-            // Buffer until Retell WS opens
-            audioBuffer.push(rawStr);
-            logger.debug(
-              "[static-ws] Buffered media frame (Retell not ready)",
-              {
-                bufferedCount: audioBuffer.length,
-                mulawBytes: normEvent.payload.length,
-                jsonBytes: Buffer.byteLength(rawStr),
-                audioProtocol: "twilio_json_media_mulaw_8khz",
-              },
-            );
-          } else if (retellWs.readyState === WebSocket.OPEN) {
-            retellWs.send(rawStr, (err) => {
-              if (err) {
-                logger.error(
-                  "[static-ws] Failed to send live media frame to Retell",
-                  {
-                    error: err.message,
-                    jsonBytes: Buffer.byteLength(rawStr),
-                  },
-                );
-              }
+          const retellFrame = makeRetellFrame(frame);
+          if (retellFrame) {
+            sendOrBufferRetellFrame(retellFrame, {
+              event: "media",
+              mulawBytes: normEvent.payload.length,
+              audioProtocol: "twilio_json_media_mulaw_8khz",
             });
           }
         }
