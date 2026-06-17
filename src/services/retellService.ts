@@ -18,13 +18,10 @@ export async function registerCall(
   toNumber: string,
   smartflowCallId: string,
 ): Promise<RegisterCallResponse> {
-  const url = `${RETELL_API_BASE}/v2/register-call`;
+  const url = `${RETELL_API_BASE}/v2/register-phone-call`;
 
   const payload = {
     agent_id: config.retellAgentId,
-    audio_websocket_protocol: "twilio",
-    audio_encoding: "mulaw",
-    sample_rate: 8000,
     from_number: fromNumber,
     to_number: toNumber,
     metadata: {
@@ -37,9 +34,7 @@ export async function registerCall(
     fromNumber,
     toNumber,
     url,
-    audioWebsocketProtocol: payload.audio_websocket_protocol,
-    audioEncoding: payload.audio_encoding,
-    sampleRate: payload.sample_rate,
+    registrationMode: "phone_call",
   });
 
   let response;

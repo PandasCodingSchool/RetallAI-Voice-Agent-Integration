@@ -34,77 +34,22 @@ function handleSmartflowStaticWs(
   let retellWs: WebSocket | null = null;
   let initialising = false; // registerCall in-flight guard
   let retellReady = false; // true once retellWs "open" fires
-  const audioBuffer: string[] = []; // Twilio-style frames buffered before Retell opens
+  const audioBuffer: Buffer[] = [];
 
   let streamSid = "";
   let chunkCounter = 0;
   let cleanupCalled = false;
   let callId = "";
 
-  const makeRetellFrame = (frame: Record<string, unknown>): string | null => {
-    const event = frame["event"] as string | undefined;
-    const sequenceNumber = frame["sequenceNumber"];
-    const streamSidValue = frame["streamSid"] as string | undefined;
-
-    if (event === "connected") {
-      return JSON.stringify({
-        event: "connected",
-        protocol: "Call",
-        version: "1.0.0",
-      });
-    }
-
-    if (event === "start") {
-      const start = frame["start"] as Record<string, unknown> | undefined;
-      const mediaFormat = start?.["mediaFormat"] as
-        | Record<string, unknown>
-        | undefined;
-      return JSON.stringify({
-        event: "start",
-        sequenceNumber: String(sequenceNumber ?? "1"),
-        streamSid: streamSidValue ?? start?.["streamSid"] ?? streamSid,
-        start: {
-          ...start,
-          streamSid: start?.["streamSid"] ?? streamSidValue ?? streamSid,
-          mediaFormat: {
-            ...mediaFormat,
-            encoding: mediaFormat?.["encoding"] ?? "audio/x-mulaw",
-            sampleRate: mediaFormat?.["sampleRate"] ?? 8000,
-            channels: mediaFormat?.["channels"] ?? 1,
-          },
-        },
-      });
-    }
-
-    if (event === "media") {
-      const media = frame["media"] as Record<string, unknown> | undefined;
-      if (typeof media?.["payload"] !== "string") return null;
-      return JSON.stringify({
-        event: "media",
-        sequenceNumber: String(sequenceNumber ?? ""),
-        streamSid: streamSidValue ?? streamSid,
-        media: {
-          track: media["track"] ?? "inbound",
-          chunk: String(media["chunk"] ?? ""),
-          timestamp: String(media["timestamp"] ?? ""),
-          payload: media["payload"],
-        },
-      });
-    }
-
-    return null;
-  };
-
-  const sendOrBufferRetellFrame = (
-    frame: string,
+  const sendOrBufferRetellAudio = (
+    audio: Buffer,
     details: Record<string, unknown>,
   ): void => {
-    const jsonBytes = Buffer.byteLength(frame);
     if (!retellWs || !retellReady) {
-      audioBuffer.push(frame);
-      logger.debug("[static-ws] Buffered frame for Retell", {
+      audioBuffer.push(audio);
+      logger.debug("[static-ws] Buffered audio for Retell", {
         bufferedCount: audioBuffer.length,
-        jsonBytes,
+        bytes: audio.length,
         retellReady,
         retellWsState: retellWs?.readyState,
         ...details,
@@ -113,26 +58,26 @@ function handleSmartflowStaticWs(
     }
 
     if (retellWs.readyState === WebSocket.OPEN) {
-      retellWs.send(frame, (err) => {
+      retellWs.send(audio, { binary: true }, (err) => {
         if (err) {
-          logger.error("[static-ws] Failed to send frame to Retell", {
+          logger.error("[static-ws] Failed to send audio to Retell", {
             error: err.message,
-            jsonBytes,
+            bytes: audio.length,
             ...details,
           });
           return;
         }
-        logger.debug("[static-ws] Sent live frame to Retell", {
-          jsonBytes,
+        logger.debug("[static-ws] Sent live audio to Retell", {
+          bytes: audio.length,
           ...details,
         });
       });
       return;
     }
 
-    logger.warn("[static-ws] Retell WebSocket not open for frame", {
+    logger.warn("[static-ws] Retell WebSocket not open for audio", {
       retellWsState: retellWs.readyState,
-      jsonBytes,
+      bytes: audio.length,
       ...details,
     });
   };
@@ -206,14 +151,14 @@ function handleSmartflowStaticWs(
       retellWs.on("open", () => {
         retellReady = true;
         const bufferedBytes = audioBuffer.reduce(
-          (sum, frame) => sum + Buffer.byteLength(frame),
+          (sum, audio) => sum + audio.length,
           0,
         );
         logger.info("[static-ws] Retell WebSocket connected", {
           retellCallId: retellCall.call_id,
           bufferedFrames: audioBuffer.length,
           bufferedBytes,
-          audioProtocol: "twilio_json_media_mulaw_8khz",
+          audioProtocol: "binary_mulaw_8khz",
         });
         const flushBufferedAudio = () => {
           if (!retellWs || retellWs.readyState !== WebSocket.OPEN) {
@@ -227,48 +172,24 @@ function handleSmartflowStaticWs(
             );
             return;
           }
-          const frame = audioBuffer.shift();
-          if (!frame) return;
-          let event: string | undefined;
-          let sequenceNumber: unknown;
-          let mediaPayloadBytes: number | undefined;
-          try {
-            const parsed = JSON.parse(frame) as {
-              event?: string;
-              sequenceNumber?: unknown;
-              media?: { payload?: string };
-            };
-            event = parsed.event;
-            sequenceNumber = parsed.sequenceNumber;
-            if (typeof parsed.media?.payload === "string") {
-              mediaPayloadBytes = Buffer.byteLength(
-                parsed.media.payload,
-                "base64",
-              );
-            }
-          } catch {
-            event = "unparseable";
-          }
-          retellWs.send(frame, (err) => {
+          const audio = audioBuffer.shift();
+          if (!audio) return;
+          retellWs.send(audio, { binary: true }, (err) => {
             if (err) {
               logger.error(
-                "[static-ws] Failed to send buffered frame to Retell",
+                "[static-ws] Failed to send buffered audio to Retell",
                 {
                   retellCallId: retellCall.call_id,
                   error: err.message,
-                  event,
-                  sequenceNumber,
+                  bytes: audio.length,
                   remainingBufferedFrames: audioBuffer.length,
                 },
               );
               return;
             }
-            logger.debug("[static-ws] Sent buffered frame to Retell", {
+            logger.debug("[static-ws] Sent buffered audio to Retell", {
               retellCallId: retellCall.call_id,
-              event,
-              sequenceNumber,
-              jsonBytes: Buffer.byteLength(frame),
-              mediaPayloadBytes,
+              bytes: audio.length,
               remainingBufferedFrames: audioBuffer.length,
             });
             setTimeout(flushBufferedAudio, 20);
@@ -279,7 +200,7 @@ function handleSmartflowStaticWs(
             count: audioBuffer.length,
             bytes: bufferedBytes,
             intervalMs: 20,
-            audioProtocol: "twilio_json_media_mulaw_8khz",
+            audioProtocol: "binary_mulaw_8khz",
           });
           flushBufferedAudio();
         }
@@ -402,15 +323,6 @@ function handleSmartflowStaticWs(
     switch (normEvent.type) {
       case "connected":
         logger.info("[static-ws] Smartflow connected handshake");
-        {
-          const retellFrame = makeRetellFrame(frame);
-          if (retellFrame) {
-            sendOrBufferRetellFrame(retellFrame, {
-              event: "connected",
-              audioProtocol: "twilio_json_media_mulaw_8khz",
-            });
-          }
-        }
         break;
 
       case "start":
@@ -420,15 +332,6 @@ function handleSmartflowStaticWs(
           from: normEvent.from,
           to: normEvent.to,
         });
-        {
-          const retellFrame = makeRetellFrame(frame);
-          if (retellFrame) {
-            sendOrBufferRetellFrame(retellFrame, {
-              event: "start",
-              audioProtocol: "twilio_json_media_mulaw_8khz",
-            });
-          }
-        }
         // ── Trigger Retell registration now that we have real phone numbers ──
         if (!initialising) {
           await initialise(
@@ -450,16 +353,11 @@ function handleSmartflowStaticWs(
             });
           }
         }
-        {
-          const retellFrame = makeRetellFrame(frame);
-          if (retellFrame) {
-            sendOrBufferRetellFrame(retellFrame, {
-              event: "media",
-              mulawBytes: normEvent.payload.length,
-              audioProtocol: "twilio_json_media_mulaw_8khz",
-            });
-          }
-        }
+        sendOrBufferRetellAudio(normEvent.payload, {
+          event: "media",
+          mulawBytes: normEvent.payload.length,
+          audioProtocol: "binary_mulaw_8khz",
+        });
         break;
 
       case "stop":
