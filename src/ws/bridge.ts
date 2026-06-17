@@ -47,7 +47,11 @@ function handleSmartflowStaticWs(
     const streamSidValue = frame["streamSid"] as string | undefined;
 
     if (event === "connected") {
-      return JSON.stringify({ event: "connected" });
+      return JSON.stringify({
+        event: "connected",
+        protocol: "Call",
+        version: "1.0.0",
+      });
     }
 
     if (event === "start") {
@@ -95,11 +99,14 @@ function handleSmartflowStaticWs(
     frame: string,
     details: Record<string, unknown>,
   ): void => {
+    const jsonBytes = Buffer.byteLength(frame);
     if (!retellWs || !retellReady) {
       audioBuffer.push(frame);
       logger.debug("[static-ws] Buffered frame for Retell", {
         bufferedCount: audioBuffer.length,
-        jsonBytes: Buffer.byteLength(frame),
+        jsonBytes,
+        retellReady,
+        retellWsState: retellWs?.readyState,
         ...details,
       });
       return;
@@ -110,12 +117,24 @@ function handleSmartflowStaticWs(
         if (err) {
           logger.error("[static-ws] Failed to send frame to Retell", {
             error: err.message,
-            jsonBytes: Buffer.byteLength(frame),
+            jsonBytes,
             ...details,
           });
+          return;
         }
+        logger.debug("[static-ws] Sent live frame to Retell", {
+          jsonBytes,
+          ...details,
+        });
       });
+      return;
     }
+
+    logger.warn("[static-ws] Retell WebSocket not open for frame", {
+      retellWsState: retellWs.readyState,
+      jsonBytes,
+      ...details,
+    });
   };
 
   const cleanup = (source: string, retellCallId?: string) => {
@@ -171,10 +190,18 @@ function handleSmartflowStaticWs(
       const retellWsUrl = `${RETELL_WS_BASE}/${retellCall.call_id}`;
       logger.info("[static-ws] Connecting to Retell WebSocket", {
         retellWsUrl,
+        hasAccessToken: !!retellCall.access_token,
+        callStatus: retellCall.call_status,
+        audioWebsocketProtocol: retellCall.audio_websocket_protocol,
+        audioEncoding: retellCall.audio_encoding,
+        sampleRate: retellCall.sample_rate,
       });
-      retellWs = new WebSocket(retellWsUrl, {
-        headers: { Authorization: `Bearer ${retellCall.access_token}` },
-      });
+      retellWs = new WebSocket(
+        retellWsUrl,
+        retellCall.access_token
+          ? { headers: { Authorization: `Bearer ${retellCall.access_token}` } }
+          : undefined,
+      );
 
       retellWs.on("open", () => {
         retellReady = true;
@@ -189,9 +216,39 @@ function handleSmartflowStaticWs(
           audioProtocol: "twilio_json_media_mulaw_8khz",
         });
         const flushBufferedAudio = () => {
-          if (!retellWs || retellWs.readyState !== WebSocket.OPEN) return;
+          if (!retellWs || retellWs.readyState !== WebSocket.OPEN) {
+            logger.warn(
+              "[static-ws] Stopping buffered flush; Retell not open",
+              {
+                retellCallId: retellCall.call_id,
+                retellWsState: retellWs?.readyState,
+                remainingBufferedFrames: audioBuffer.length,
+              },
+            );
+            return;
+          }
           const frame = audioBuffer.shift();
           if (!frame) return;
+          let event: string | undefined;
+          let sequenceNumber: unknown;
+          let mediaPayloadBytes: number | undefined;
+          try {
+            const parsed = JSON.parse(frame) as {
+              event?: string;
+              sequenceNumber?: unknown;
+              media?: { payload?: string };
+            };
+            event = parsed.event;
+            sequenceNumber = parsed.sequenceNumber;
+            if (typeof parsed.media?.payload === "string") {
+              mediaPayloadBytes = Buffer.byteLength(
+                parsed.media.payload,
+                "base64",
+              );
+            }
+          } catch {
+            event = "unparseable";
+          }
           retellWs.send(frame, (err) => {
             if (err) {
               logger.error(
@@ -199,10 +256,21 @@ function handleSmartflowStaticWs(
                 {
                   retellCallId: retellCall.call_id,
                   error: err.message,
+                  event,
+                  sequenceNumber,
+                  remainingBufferedFrames: audioBuffer.length,
                 },
               );
               return;
             }
+            logger.debug("[static-ws] Sent buffered frame to Retell", {
+              retellCallId: retellCall.call_id,
+              event,
+              sequenceNumber,
+              jsonBytes: Buffer.byteLength(frame),
+              mediaPayloadBytes,
+              remainingBufferedFrames: audioBuffer.length,
+            });
             setTimeout(flushBufferedAudio, 20);
           });
         };
@@ -286,6 +354,9 @@ function handleSmartflowStaticWs(
           code,
           reason: reason.toString(),
           retellCallId: retellCall.call_id,
+          bufferedFramesRemaining: audioBuffer.length,
+          retellReady,
+          smartflowWsState: smartflowWs.readyState,
         });
         cleanup("retell", retellCall.call_id);
       });
@@ -486,9 +557,12 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     });
 
     const retellWsUrl = `${RETELL_WS_BASE}/${session.retellCallId}`;
-    const retellWs = new WebSocket(retellWsUrl, {
-      headers: { Authorization: `Bearer ${session.retellAccessToken}` },
-    });
+    const retellWs = new WebSocket(
+      retellWsUrl,
+      session.retellAccessToken
+        ? { headers: { Authorization: `Bearer ${session.retellAccessToken}` } }
+        : undefined,
+    );
     session.retellWs = retellWs;
 
     retellWs.on("open", () => {

@@ -6,7 +6,11 @@ const RETELL_API_BASE = "https://api.retellai.com";
 
 export interface RegisterCallResponse {
   call_id: string;
-  access_token: string;
+  access_token?: string;
+  call_status?: string;
+  audio_websocket_protocol?: string;
+  audio_encoding?: string;
+  sample_rate?: number;
 }
 
 export async function registerCall(
@@ -14,10 +18,13 @@ export async function registerCall(
   toNumber: string,
   smartflowCallId: string,
 ): Promise<RegisterCallResponse> {
-  const url = `${RETELL_API_BASE}/v2/register-phone-call`;
+  const url = `${RETELL_API_BASE}/register-call`;
 
   const payload = {
     agent_id: config.retellAgentId,
+    audio_websocket_protocol: "twilio",
+    audio_encoding: "mulaw",
+    sample_rate: 8000,
     from_number: fromNumber,
     to_number: toNumber,
     metadata: {
@@ -30,6 +37,9 @@ export async function registerCall(
     fromNumber,
     toNumber,
     url,
+    audioWebsocketProtocol: payload.audio_websocket_protocol,
+    audioEncoding: payload.audio_encoding,
+    sampleRate: payload.sample_rate,
   });
 
   const response = await axios.post<RegisterCallResponse>(url, payload, {
@@ -43,6 +53,11 @@ export async function registerCall(
   logger.info("Retell call registered", {
     smartflowCallId,
     retellCallId: response.data.call_id,
+    callStatus: response.data.call_status,
+    audioWebsocketProtocol: response.data.audio_websocket_protocol,
+    audioEncoding: response.data.audio_encoding,
+    sampleRate: response.data.sample_rate,
+    hasAccessToken: !!response.data.access_token,
   });
 
   return response.data;
