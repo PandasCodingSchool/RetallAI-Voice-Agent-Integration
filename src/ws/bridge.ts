@@ -158,7 +158,7 @@ function handleSmartflowStaticWs(
           retellCallId: retellCall.call_id,
           bufferedFrames: audioBuffer.length,
           bufferedBytes,
-          audioProtocol: "binary_mulaw_8khz",
+          audioProtocol: "binary_linear16_16khz",
         });
         const flushBufferedAudio = () => {
           if (!retellWs || retellWs.readyState !== WebSocket.OPEN) {
@@ -200,7 +200,7 @@ function handleSmartflowStaticWs(
             count: audioBuffer.length,
             bytes: bufferedBytes,
             intervalMs: 20,
-            audioProtocol: "binary_mulaw_8khz",
+            audioProtocol: "binary_linear16_16khz",
           });
           flushBufferedAudio();
         }
@@ -353,11 +353,15 @@ function handleSmartflowStaticWs(
             });
           }
         }
-        sendOrBufferRetellAudio(normEvent.payload, {
-          event: "media",
-          mulawBytes: normEvent.payload.length,
-          audioProtocol: "binary_mulaw_8khz",
-        });
+        {
+          const pcmPayload = mulawToLinear16x2(normEvent.payload);
+          sendOrBufferRetellAudio(pcmPayload, {
+            event: "media",
+            mulawBytes: normEvent.payload.length,
+            pcmBytes: pcmPayload.length,
+            audioProtocol: "binary_linear16_16khz",
+          });
+        }
         break;
 
       case "stop":
