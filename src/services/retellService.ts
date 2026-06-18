@@ -30,7 +30,7 @@ export async function registerCall(
     // Use native telephony format - Smartflow sends µ-law 8kHz like Twilio
     audio_encoding: "mulaw",
     sample_rate: 8000,
-    audio_websocket_protocol: "twilio",
+    audio_websocket_protocol: "web",
   };
 
   logger.info("Registering call with Retell AI", {
