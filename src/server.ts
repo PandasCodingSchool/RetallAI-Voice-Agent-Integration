@@ -31,7 +31,7 @@ attachWebSocketBridge(server);
 startSessionCleanup();
 
 server.listen(config.port, () => {
-  logger.info("RetallAI-Smartflow bridge server started", {
+  logger.info("RetallAI-Smartflow bridge server started (Web Protocol Fix - v1.0.1)", {
     port: config.port,
     serverWssHost: config.serverWssHost,
   });

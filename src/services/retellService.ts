@@ -39,6 +39,7 @@ export async function registerCall(
     toNumber,
     url,
     registrationMode: "phone_call",
+    audioWebsocketProtocol: payload.audio_websocket_protocol,
   });
 
   let response;

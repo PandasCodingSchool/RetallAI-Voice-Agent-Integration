@@ -55,7 +55,8 @@ async function run(): Promise<void> {
       "",
     );
     const pathPart = resp.data.wss_url.replace(/^wss?:\/\/[^/]+/, "");
-    wssUrl = `wss://${cleanWssHost}${pathPart}`;
+    const protocol = SERVER_WSS.startsWith("wss://") ? "wss" : "ws";
+    wssUrl = `${protocol}://${cleanWssHost}${pathPart}`;
     console.log(`[1/3] Got wss_url: ${wssUrl}`);
   } catch (err) {
     console.error("[1/3] FAILED:", err instanceof Error ? err.message : err);
