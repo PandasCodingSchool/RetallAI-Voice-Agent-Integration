@@ -160,6 +160,7 @@ function handleSmartflowStaticWs(
           bufferedBytes,
           audioProtocol: "binary_linear16_16khz",
         });
+        const AUDIO_CHUNK_DURATION_MS = 60; // Each µ-law chunk from Smartflow is 60ms (480 bytes at 8kHz)
         const flushBufferedAudio = () => {
           if (!retellWs || retellWs.readyState !== WebSocket.OPEN) {
             logger.warn(
@@ -192,14 +193,15 @@ function handleSmartflowStaticWs(
               bytes: audio.length,
               remainingBufferedFrames: audioBuffer.length,
             });
-            setTimeout(flushBufferedAudio, 20);
+            // Throttle to match real-time: wait for the duration of audio just sent
+            setTimeout(flushBufferedAudio, AUDIO_CHUNK_DURATION_MS);
           });
         };
         if (audioBuffer.length > 0) {
           logger.info("[static-ws] Flushing buffered media frames to Retell", {
             count: audioBuffer.length,
             bytes: bufferedBytes,
-            intervalMs: 20,
+            intervalMs: AUDIO_CHUNK_DURATION_MS,
             audioProtocol: "binary_linear16_16khz",
           });
           flushBufferedAudio();
@@ -342,7 +344,7 @@ function handleSmartflowStaticWs(
         }
         break;
 
-      case "audio":
+      case "audio": {
         // Update streamSid from media frame if not yet set
         if (!streamSid) {
           const mediaSid = frame["streamSid"] as string | undefined;
@@ -353,16 +355,34 @@ function handleSmartflowStaticWs(
             });
           }
         }
-        {
-          const pcmPayload = mulawToLinear16x2(normEvent.payload);
-          sendOrBufferRetellAudio(pcmPayload, {
-            event: "media",
-            mulawBytes: normEvent.payload.length,
-            pcmBytes: pcmPayload.length,
-            audioProtocol: "binary_linear16_16khz",
-          });
-        }
+        // Log detailed audio frame info for debugging
+        const media = frame["media"] as Record<string, unknown> | undefined;
+        const chunk = media?.["chunk"] as number | undefined;
+        const timestamp = media?.["timestamp"] as number | undefined;
+        const payloadB64 = media?.["payload"] as string | undefined;
+        const mulawBytes = payloadB64
+          ? Buffer.from(payloadB64, "base64").length
+          : normEvent.payload.length;
+        const pcmBytes = mulawBytes * 4; // 2x upsample × 2 bytes per sample
+
+        logger.debug("[static-ws] Smartflow audio frame", {
+          chunk,
+          timestamp,
+          mulawBytes,
+          pcmBytes,
+          mulawDurationMs: Math.round((mulawBytes / 8000) * 1000), // µ-law at 8kHz
+          pcmDurationMs: Math.round((pcmBytes / 2 / 16000) * 1000), // linear16 at 16kHz
+        });
+
+        const pcmPayload = mulawToLinear16x2(normEvent.payload);
+        sendOrBufferRetellAudio(pcmPayload, {
+          event: "media",
+          mulawBytes: normEvent.payload.length,
+          pcmBytes: pcmPayload.length,
+          audioProtocol: "binary_linear16_16khz",
+        });
         break;
+      }
 
       case "stop":
         logger.info("[static-ws] Smartflow stop event");

@@ -8,7 +8,8 @@
     "start": "node dist/server.js",
     "dev": "nodemon --exec ts-node src/server.ts",
     "lint": "tsc --noEmit",
-    "simulate": "ts-node test/simulate-smartflow.ts"
+    "simulate": "ts-node test/simulate-smartflow.ts",
+    "simulate:static": "ts-node test/simulate-static-smartflow.ts"
   },
   "dependencies": {
     "axios": "^1.7.2",
