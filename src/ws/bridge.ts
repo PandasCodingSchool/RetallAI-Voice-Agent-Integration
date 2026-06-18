@@ -6,7 +6,7 @@ import { getSession, deleteSession } from "../utils/sessionStore";
 import { logger } from "../utils/logger";
 import { getAdapter } from "../adapters";
 import { registerCall } from "../services/retellService";
-import { mulawToLinear16x2, linear16x2ToMulaw } from "../utils/audioTranscode";
+// Audio transcoding not needed - using native µ-law 8kHz with twilio protocol
 
 const RETELL_WS_BASE = "wss://api.retellai.com/audio-websocket";
 
@@ -158,7 +158,7 @@ function handleSmartflowStaticWs(
           retellCallId: retellCall.call_id,
           bufferedFrames: audioBuffer.length,
           bufferedBytes,
-          audioProtocol: "binary_linear16_16khz",
+          audioProtocol: "binary_mulaw_8khz",
         });
         const AUDIO_CHUNK_DURATION_MS = 60; // Each µ-law chunk from Smartflow is 60ms (480 bytes at 8kHz)
         const flushBufferedAudio = () => {
@@ -202,7 +202,7 @@ function handleSmartflowStaticWs(
             count: audioBuffer.length,
             bytes: bufferedBytes,
             intervalMs: AUDIO_CHUNK_DURATION_MS,
-            audioProtocol: "binary_linear16_16khz",
+            audioProtocol: "binary_mulaw_8khz",
           });
           flushBufferedAudio();
         }
@@ -211,10 +211,9 @@ function handleSmartflowStaticWs(
       retellWs.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
         if (isBinary) {
           if (smartflowWs.readyState !== WebSocket.OPEN) return;
-          const pcmBuf =
+          // Retell sends µ-law 8kHz (matching our registration), pass through to Smartflow
+          const audioBuf =
             data instanceof Buffer ? data : Buffer.from(data as ArrayBuffer);
-          // Transcode linear-16 16kHz → µ-law 8kHz before sending back to Smartflow
-          const audioBuf = linear16x2ToMulaw(pcmBuf);
           chunkCounter++;
           const outFrame = adapter.encodeAudio(audioBuf, {
             streamSid,
@@ -363,23 +362,21 @@ function handleSmartflowStaticWs(
         const mulawBytes = payloadB64
           ? Buffer.from(payloadB64, "base64").length
           : normEvent.payload.length;
-        const pcmBytes = mulawBytes * 4; // 2x upsample × 2 bytes per sample
+        const durationMs = Math.round((mulawBytes / 8000) * 1000); // µ-law at 8kHz
 
         logger.debug("[static-ws] Smartflow audio frame", {
           chunk,
           timestamp,
           mulawBytes,
-          pcmBytes,
-          mulawDurationMs: Math.round((mulawBytes / 8000) * 1000), // µ-law at 8kHz
-          pcmDurationMs: Math.round((pcmBytes / 2 / 16000) * 1000), // linear16 at 16kHz
+          durationMs,
         });
 
-        const pcmPayload = mulawToLinear16x2(normEvent.payload);
-        sendOrBufferRetellAudio(pcmPayload, {
+        // Send raw µ-law audio to Retell (matching the twilio protocol)
+        sendOrBufferRetellAudio(normEvent.payload, {
           event: "media",
-          mulawBytes: normEvent.payload.length,
-          pcmBytes: pcmPayload.length,
-          audioProtocol: "binary_linear16_16khz",
+          bytes: normEvent.payload.length,
+          durationMs,
+          audioProtocol: "binary_mulaw_8khz",
         });
         break;
       }
@@ -519,9 +516,9 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
           break;
 
         case "audio": {
-          const pcmPayload = mulawToLinear16x2(event.payload);
+          // Send raw µ-law audio to Retell (matching the twilio protocol)
           if (retellWs.readyState === WebSocket.OPEN) {
-            retellWs.send(pcmPayload, { binary: true });
+            retellWs.send(event.payload, { binary: true });
           } else {
             logger.warn("[bridge] Retell WS not open, dropping audio frame", {
               retellWsState: retellWs.readyState,
@@ -545,10 +542,9 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
       if (isBinary) {
         if (smartflowWs.readyState !== WebSocket.OPEN) return;
 
-        const pcmBuf =
+        // Retell sends µ-law 8kHz (matching our registration), pass through to Smartflow
+        const audioBuf =
           data instanceof Buffer ? data : Buffer.from(data as ArrayBuffer);
-        // Transcode linear-16 16kHz → µ-law 8kHz before sending back to vendor
-        const audioBuf = linear16x2ToMulaw(pcmBuf);
         chunkCounter++;
 
         const frame = adapter.encodeAudio(audioBuf, {
