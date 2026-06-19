@@ -22,8 +22,27 @@ const CALL_SID = `CA${MOCK_CALL.callId}`;
 const AUDIO_CHUNK_BYTES = 800;
 const AUDIO_SEND_INTERVAL = 100;
 
-function makeSilenceChunk(): string {
-  return Buffer.alloc(AUDIO_CHUNK_BYTES, 0xff).toString("base64");
+let phase = 0;
+function makeVoiceChunk(): string {
+  const buf = Buffer.alloc(AUDIO_CHUNK_BYTES);
+  for (let i = 0; i < AUDIO_CHUNK_BYTES; i++) {
+    // Generate sine wave (approx 440Hz)
+    const sample = Math.floor(Math.sin(phase) * 8000);
+    phase += (440 * 2 * Math.PI) / 8000;
+    
+    // Simple PCM16 to mu-law algorithm
+    let pcm = sample;
+    const MAX = 32635; const BIAS = 0x84;
+    const sign = pcm < 0 ? 0x80 : 0x00;
+    if (pcm < 0) pcm = -pcm;
+    if (pcm > MAX) pcm = MAX;
+    pcm += BIAS;
+    let exponent = 7;
+    for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+    const mantissa = (pcm >> (exponent + 3)) & 0x0f;
+    buf[i] = ~(sign | (exponent << 4) | mantissa) & 0xff;
+  }
+  return buf.toString("base64");
 }
 
 function send(ws: WebSocket, obj: unknown): void {
@@ -114,7 +133,7 @@ async function run(): Promise<void> {
           media: {
             chunk: String(chunksSent + 1),
             timestamp: String(chunksSent * 100),
-            payload: makeSilenceChunk(),
+            payload: makeVoiceChunk(),
           },
         });
         chunksSent++;

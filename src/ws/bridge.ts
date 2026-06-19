@@ -127,16 +127,13 @@ function runBridge(
         // Remove processed chunk from accumulator
         mulawAccum = Buffer.from(mulawAccum.buffer, mulawAccum.byteOffset + FRAME_SAMPLES, mulawAccum.byteLength - FRAME_SAMPLES);
         
-        // Upsample 8000Hz to 24000Hz (3x)
-        const pcm24k = new Int16Array(FRAME_SAMPLES * 3);
+        // Convert 8000Hz µ-law to 8000Hz PCM (no manual upsampling, rely on LiveKit WebRTC)
+        const pcm8k = new Int16Array(FRAME_SAMPLES);
         for (let i = 0; i < FRAME_SAMPLES; i++) {
-          const sample = mulawToPcm16(chunk[i]);
-          pcm24k[i * 3] = sample;
-          pcm24k[i * 3 + 1] = sample;
-          pcm24k[i * 3 + 2] = sample;
+          pcm8k[i] = mulawToPcm16(chunk[i]);
         }
         
-        const frame = new AudioFrame(pcm24k, 24000, NUM_CHANNELS, FRAME_SAMPLES * 3);
+        const frame = new AudioFrame(pcm8k, 8000, NUM_CHANNELS, FRAME_SAMPLES);
         await audioSource.captureFrame(frame);
       }
     } catch (err) {
@@ -149,7 +146,7 @@ function runBridge(
   // ── Connect to Retell via LiveKit ────────────────────────────────────────
   (async () => {
     try {
-      audioSource = new AudioSource(24000, NUM_CHANNELS);
+      audioSource = new AudioSource(8000, NUM_CHANNELS);
       localTrack = LocalAudioTrack.createAudioTrack("user_audio", audioSource);
 
       const publishOpts = new TrackPublishOptions();
