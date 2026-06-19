@@ -127,13 +127,19 @@ function runBridge(
         // Remove processed chunk from accumulator
         mulawAccum = Buffer.from(mulawAccum.buffer, mulawAccum.byteOffset + FRAME_SAMPLES, mulawAccum.byteLength - FRAME_SAMPLES);
         
-        // Convert 8000Hz µ-law to 8000Hz PCM (no manual upsampling, rely on LiveKit WebRTC)
-        const pcm8k = new Int16Array(FRAME_SAMPLES);
+        // Linear Interpolation: smoothly upsample 8000Hz to 24000Hz (3x)
+        // This avoids metallic/ZOH aliasing while satisfying Retell's 24kHz expectation.
+        const pcm24k = new Int16Array(FRAME_SAMPLES * 3);
         for (let i = 0; i < FRAME_SAMPLES; i++) {
-          pcm8k[i] = mulawToPcm16(chunk[i]);
+          const sample1 = mulawToPcm16(chunk[i]);
+          const sample2 = i + 1 < FRAME_SAMPLES ? mulawToPcm16(chunk[i + 1]) : sample1;
+          
+          pcm24k[i * 3] = sample1;
+          pcm24k[i * 3 + 1] = Math.floor(sample1 + (sample2 - sample1) * 0.3333);
+          pcm24k[i * 3 + 2] = Math.floor(sample1 + (sample2 - sample1) * 0.6667);
         }
         
-        const frame = new AudioFrame(pcm8k, 8000, NUM_CHANNELS, FRAME_SAMPLES);
+        const frame = new AudioFrame(pcm24k, 24000, NUM_CHANNELS, FRAME_SAMPLES * 3);
         await audioSource.captureFrame(frame);
       }
     } catch (err) {
@@ -146,11 +152,12 @@ function runBridge(
   // ── Connect to Retell via LiveKit ────────────────────────────────────────
   (async () => {
     try {
-      audioSource = new AudioSource(8000, NUM_CHANNELS);
+      audioSource = new AudioSource(24000, NUM_CHANNELS);
       localTrack = LocalAudioTrack.createAudioTrack("user_audio", audioSource);
 
       const publishOpts = new TrackPublishOptions();
       publishOpts.source = TrackSource.SOURCE_MICROPHONE;
+      publishOpts.dtx = false; // Disable Discontinuous Transmission to prevent aggressive WebRTC VAD dropping
 
       room.on(RoomEvent.Connected, async () => {
         logger.info("[bridge] LiveKit room connected", { retellCallId, roomName: room.name });
