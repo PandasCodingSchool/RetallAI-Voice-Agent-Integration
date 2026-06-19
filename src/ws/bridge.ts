@@ -114,8 +114,14 @@ function runBridge(
     onCleanup?.();
   };
 
+  // ── Audio gain: telephony codecs (G.711 µ-law) use low signal levels.
+  // Retell's WebRTC VAD/STT requires a much higher amplitude to detect speech.
+  // We apply a gain of 20x (26dB), clamped to int16 range, before sending.
+  const GAIN = 20;
+
   // ── Helper: push µ-law buffer to Retell as 20ms PCM frames ──────────────
   let isFlushing = false;
+  let debugFrameCount = 0;
   const processAudioQueue = async () => {
     if (isFlushing || !audioSource || room.connectionState !== ConnectionState.CONN_CONNECTED) return;
     isFlushing = true;
@@ -128,15 +134,32 @@ function runBridge(
         mulawAccum = Buffer.from(mulawAccum.buffer, mulawAccum.byteOffset + FRAME_SAMPLES, mulawAccum.byteLength - FRAME_SAMPLES);
         
         // Linear Interpolation: smoothly upsample 8000Hz to 24000Hz (3x)
-        // This avoids metallic/ZOH aliasing while satisfying Retell's 24kHz expectation.
+        // Apply GAIN to ensure Retell's VAD engine can detect speech.
         const pcm24k = new Int16Array(FRAME_SAMPLES * 3);
+        let rmsSum = 0;
         for (let i = 0; i < FRAME_SAMPLES; i++) {
-          const sample1 = mulawToPcm16(chunk[i]);
-          const sample2 = i + 1 < FRAME_SAMPLES ? mulawToPcm16(chunk[i + 1]) : sample1;
-          
-          pcm24k[i * 3] = sample1;
-          pcm24k[i * 3 + 1] = Math.floor(sample1 + (sample2 - sample1) * 0.3333);
-          pcm24k[i * 3 + 2] = Math.floor(sample1 + (sample2 - sample1) * 0.6667);
+          const raw1 = mulawToPcm16(chunk[i]);
+          const raw2 = i + 1 < FRAME_SAMPLES ? mulawToPcm16(chunk[i + 1]) : raw1;
+
+          // Apply gain and clamp to int16 range
+          const s1 = Math.max(-32768, Math.min(32767, raw1 * GAIN));
+          const s2 = Math.max(-32768, Math.min(32767, raw2 * GAIN));
+          rmsSum += s1 * s1;
+
+          pcm24k[i * 3]     = s1;
+          pcm24k[i * 3 + 1] = Math.floor(s1 + (s2 - s1) * 0.3333);
+          pcm24k[i * 3 + 2] = Math.floor(s1 + (s2 - s1) * 0.6667);
+        }
+
+        // Log RMS of first 20 frames sent to Retell for diagnostics
+        if (debugFrameCount < 20) {
+          const rms = Math.sqrt(rmsSum / FRAME_SAMPLES);
+          logger.debug("[bridge] Inbound audio frame RMS (after gain)", {
+            frame: debugFrameCount,
+            rms: Math.round(rms),
+            gain: GAIN,
+          });
+          debugFrameCount++;
         }
         
         const frame = new AudioFrame(pcm24k, 24000, NUM_CHANNELS, FRAME_SAMPLES * 3);
