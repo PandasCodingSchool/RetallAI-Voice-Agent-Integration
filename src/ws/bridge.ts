@@ -1,35 +1,34 @@
 import WebSocket, { WebSocketServer } from "ws";
 import http from "http";
 import url from "url";
+import { v4 as uuidv4 } from "uuid";
 import {
   Room,
   RoomEvent,
   AudioSource,
   LocalAudioTrack,
   AudioStream,
-  AudioFrame,
   TrackKind,
   TrackPublishOptions,
   TrackSource,
   ConnectionState,
 } from "@livekit/rtc-node";
 import { getSession, deleteSession } from "../utils/sessionStore";
+import { registerCall } from "../services/retellService";
 import { logger } from "../utils/logger";
 import { getAdapter } from "../adapters";
+import { AudioFrame } from "@livekit/rtc-node";
 
 // Retell AI's LiveKit server — discovered from retell-client-js-sdk source
 const RETELL_LIVEKIT_URL = "wss://retell-ai-4ihahnq7.livekit.cloud";
 
-// Smartflow sends µ-law 8 kHz mono — same as Twilio
+// Smartflow sends µ-law 8 kHz mono
 const SAMPLE_RATE = 8000;
 const NUM_CHANNELS = 1;
-// 20 ms frames — standard for VoIP (160 samples @ 8 kHz)
+// 20 ms frames — 160 samples @ 8 kHz
 const FRAME_SAMPLES = 160;
 
-/**
- * Decode µ-law byte to 16-bit PCM sample.
- * Reference: ITU-T G.711
- */
+/** Decode µ-law byte → 16-bit PCM sample (ITU-T G.711) */
 function mulawToPcm16(mulaw: number): number {
   mulaw = ~mulaw & 0xff;
   const sign = mulaw & 0x80 ? -1 : 1;
@@ -39,15 +38,12 @@ function mulawToPcm16(mulaw: number): number {
   return Math.max(-32768, Math.min(32767, sample));
 }
 
-/**
- * Encode 16-bit PCM sample to µ-law byte.
- */
+/** Encode 16-bit PCM sample → µ-law byte */
 function pcm16ToMulaw(sample: number): number {
-  const MAX = 32767;
   const BIAS = 0x84;
   const sign = sample < 0 ? 0x80 : 0x00;
   let s = Math.abs(sample);
-  if (s > MAX) s = MAX;
+  if (s > 32767) s = 32767;
   s += BIAS;
   let exponent = 7;
   for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
@@ -55,26 +51,204 @@ function pcm16ToMulaw(sample: number): number {
   return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
 
-/**
- * Convert a Buffer of µ-law bytes to an Int16Array of PCM samples.
- */
 function mulawBufToPcm16(buf: Buffer): Int16Array {
   const out = new Int16Array(buf.length);
-  for (let i = 0; i < buf.length; i++) {
-    out[i] = mulawToPcm16(buf[i]);
-  }
+  for (let i = 0; i < buf.length; i++) out[i] = mulawToPcm16(buf[i]);
+  return out;
+}
+
+function pcm16BufToMulaw(samples: Int16Array): Buffer {
+  const out = Buffer.allocUnsafe(samples.length);
+  for (let i = 0; i < samples.length; i++) out[i] = pcm16ToMulaw(samples[i]);
   return out;
 }
 
 /**
- * Convert an Int16Array of PCM samples to a Buffer of µ-law bytes.
+ * Core bridge logic — shared by both token mode and static mode.
+ * Connects to Retell via LiveKit using the given access_token,
+ * and relays audio between the Smartflow WS and the LiveKit room.
  */
-function pcm16BufToMulaw(samples: Int16Array): Buffer {
-  const out = Buffer.allocUnsafe(samples.length);
-  for (let i = 0; i < samples.length; i++) {
-    out[i] = pcm16ToMulaw(samples[i]);
-  }
-  return out;
+function runBridge(
+  smartflowWs: WebSocket,
+  retellCallId: string,
+  retellAccessToken: string,
+  vendor: string,
+  smartflowCallId: string,
+  initialStreamSid: string,
+  onCleanup?: () => void,
+): void {
+  const adapter = getAdapter(vendor);
+  let streamSid = initialStreamSid;
+  let chunkCounter = 0;
+  let cleanupCalled = false;
+
+  const room = new Room();
+  let audioSource: AudioSource | null = null;
+  let localTrack: LocalAudioTrack | null = null;
+  let publishedTrackSid: string | undefined;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let mulawAccum: any = Buffer.alloc(0);
+
+  // ── Cleanup ──────────────────────────────────────────────────────────────
+  const cleanup = async (source: string) => {
+    if (cleanupCalled) return;
+    cleanupCalled = true;
+
+    logger.info("[bridge] Call session ending", {
+      source,
+      vendor,
+      smartflowCallId,
+      retellCallId,
+      chunksSentToVendor: chunkCounter,
+    });
+
+    try {
+      if (publishedTrackSid) await room.localParticipant?.unpublishTrack(publishedTrackSid);
+      await room.disconnect();
+    } catch { /* best-effort */ }
+
+    if (smartflowWs.readyState === WebSocket.OPEN || smartflowWs.readyState === WebSocket.CONNECTING) {
+      smartflowWs.close(1000, "call ended");
+    }
+
+    onCleanup?.();
+  };
+
+  // ── Helper: push µ-law buffer to Retell as 20ms PCM frames ──────────────
+  const flushMulawToRetell = (buf: Buffer): Buffer => {
+    if (!audioSource) return buf;
+    let offset = 0;
+    while (offset + FRAME_SAMPLES <= buf.length) {
+      const chunk = buf.slice(offset, offset + FRAME_SAMPLES);
+      const pcm = mulawBufToPcm16(chunk);
+      const frame = new AudioFrame(pcm, SAMPLE_RATE, NUM_CHANNELS, FRAME_SAMPLES);
+      audioSource.captureFrame(frame);
+      offset += FRAME_SAMPLES;
+    }
+    return Buffer.from(buf.buffer, buf.byteOffset + offset, buf.byteLength - offset);
+  };
+
+  // ── Connect to Retell via LiveKit ────────────────────────────────────────
+  (async () => {
+    try {
+      audioSource = new AudioSource(SAMPLE_RATE, NUM_CHANNELS);
+      localTrack = LocalAudioTrack.createAudioTrack("user_audio", audioSource);
+
+      const publishOpts = new TrackPublishOptions();
+      publishOpts.source = TrackSource.SOURCE_MICROPHONE;
+
+      room.on(RoomEvent.Connected, async () => {
+        logger.info("[bridge] LiveKit room connected", { retellCallId, roomName: room.name });
+
+        const pub = await room.localParticipant?.publishTrack(localTrack!, publishOpts);
+        publishedTrackSid = pub?.sid;
+        logger.info("[bridge] Published user audio track to Retell LiveKit room");
+
+        // Flush buffered audio that arrived before LiveKit connected
+        if (mulawAccum.length > 0) {
+          mulawAccum = flushMulawToRetell(mulawAccum);
+        }
+
+        if (adapter.onOpen) {
+          adapter.onOpen(smartflowWs, { streamSid, chunkCounter });
+        }
+      });
+
+      room.on(RoomEvent.Disconnected, () => {
+        logger.info("[bridge] LiveKit room disconnected", { retellCallId });
+        cleanup("retell-livekit-disconnect");
+      });
+
+      // Subscribe to agent audio (Retell → Smartflow)
+      room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+        if (track.kind !== TrackKind.KIND_AUDIO) return;
+        logger.info("[bridge] Subscribed to Retell agent audio track", {
+          trackName: publication.name,
+          participantIdentity: participant.identity,
+        });
+
+        const audioStream = new AudioStream(track, SAMPLE_RATE, NUM_CHANNELS);
+        (async () => {
+          for await (const frame of audioStream) {
+            if (smartflowWs.readyState !== WebSocket.OPEN) break;
+            const mulaw = pcm16BufToMulaw(frame.data as Int16Array);
+            chunkCounter++;
+            const encodedFrame = adapter.encodeAudio(mulaw, { streamSid, chunkCounter });
+            smartflowWs.send(encodedFrame);
+            if (chunkCounter === 1) {
+              logger.info("[bridge] First agent audio frame sent to vendor", {
+                vendor,
+                retellCallId,
+                bytes: mulaw.length,
+              });
+            }
+          }
+        })().catch((err) => {
+          logger.error("[bridge] Error reading agent audio stream", { error: (err as Error).message });
+        });
+      });
+
+      await room.connect(RETELL_LIVEKIT_URL, retellAccessToken, {
+        autoSubscribe: true,
+        dynacast: false,
+      });
+
+    } catch (err) {
+      logger.error("[bridge] Failed to connect to Retell LiveKit room", {
+        retellCallId,
+        error: (err as Error).message,
+      });
+      cleanup("retell-connect-error");
+    }
+  })();
+
+  // ── Smartflow → Retell (inbound user audio) ──────────────────────────────
+  smartflowWs.on("message", (raw: WebSocket.RawData) => {
+    const event = adapter.decode(raw);
+    if (!event) return;
+
+    switch (event.type) {
+      case "connected":
+        logger.info("[bridge] Vendor stream connected handshake", { vendor, smartflowCallId });
+        break;
+
+      case "start":
+        streamSid = event.streamSid;
+        logger.info("[bridge] Vendor stream started", { vendor, streamSid, from: event.from, to: event.to });
+        break;
+
+      case "audio": {
+        const incomingBuf: Buffer = Buffer.isBuffer(event.payload)
+          ? (event.payload as Buffer)
+          : Buffer.from(event.payload as string, "base64");
+
+        if (!audioSource || room.connectionState !== ConnectionState.CONN_CONNECTED) {
+          mulawAccum = Buffer.concat([mulawAccum, incomingBuf]);
+        } else {
+          const combined = mulawAccum.length > 0
+            ? Buffer.concat([mulawAccum, incomingBuf])
+            : incomingBuf;
+          mulawAccum = flushMulawToRetell(combined);
+        }
+        break;
+      }
+
+      case "stop":
+        logger.info("[bridge] Vendor stream stop event", { vendor, streamSid });
+        cleanup("vendor-stop");
+        break;
+    }
+  });
+
+  smartflowWs.on("close", (code: number, reason: Buffer) => {
+    logger.info("[bridge] Smartflow WebSocket closed", { code, reason: reason.toString(), smartflowCallId });
+    cleanup("smartflow");
+  });
+
+  smartflowWs.on("error", (err: Error) => {
+    logger.error("[bridge] Smartflow WebSocket error", { smartflowCallId, error: err.message });
+    cleanup("smartflow-error");
+  });
 }
 
 export function attachWebSocketBridge(server: http.Server): WebSocketServer {
@@ -84,237 +258,122 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     const parsedUrl = url.parse(req.url ?? "", true);
     const token = parsedUrl.query["token"] as string | undefined;
 
-    if (!token) {
-      logger.warn("[bridge] WebSocket connection rejected: missing token");
-      smartflowWs.close(4001, "Missing token");
-      return;
-    }
-
-    const session = getSession(token);
-    if (!session) {
-      logger.warn("[bridge] WebSocket connection rejected: invalid or expired token", { token });
-      smartflowWs.close(4002, "Invalid or expired token");
-      return;
-    }
-
-    session.smartflowWs = smartflowWs;
-    const adapter = getAdapter(session.vendor);
-    let streamSid = "";
-    let chunkCounter = 0;
-    let cleanupCalled = false;
-
-    // LiveKit room & audio objects
-    const room = new Room();
-    let audioSource: AudioSource | null = null;
-    let localTrack: LocalAudioTrack | null = null;
-    let publishedTrackSid: string | undefined;
-    // Accumulate µ-law bytes until we have a full 20ms frame
-    let mulawAccum = Buffer.alloc(0);
-
-    logger.info("[bridge] Vendor WebSocket connected", {
-      token,
-      vendor: session.vendor,
-      smartflowCallId: session.smartflowCallId,
-      retellCallId: session.retellCallId,
-    });
-
-    // ── Cleanup ────────────────────────────────────────────────────────────
-    const cleanup = async (source: string) => {
-      if (cleanupCalled) return;
-      cleanupCalled = true;
-
-      logger.info("[bridge] Call session ending", {
-        source,
-        vendor: session.vendor,
+    // ── Token mode: pre-registered via HTTP POST /voice/endpoint ─────────
+    if (token) {
+      const session = getSession(token);
+      if (!session) {
+        logger.warn("[bridge] WebSocket connection rejected: invalid or expired token", { token });
+        smartflowWs.close(4002, "Invalid or expired token");
+        return;
+      }
+      session.smartflowWs = smartflowWs;
+      logger.info("[bridge] Token-mode WebSocket connected", {
         token,
+        vendor: session.vendor,
         smartflowCallId: session.smartflowCallId,
         retellCallId: session.retellCallId,
-        chunksSentToVendor: chunkCounter,
       });
+      runBridge(
+        smartflowWs,
+        session.retellCallId,
+        session.retellAccessToken,
+        session.vendor,
+        session.smartflowCallId,
+        "",
+        () => deleteSession(token),
+      );
+      return;
+    }
 
-      try {
-        if (publishedTrackSid) await room.localParticipant?.unpublishTrack(publishedTrackSid);
-        await room.disconnect();
-      } catch { /* best-effort */ }
+    // ── Static mode: Smartflow connects directly with no prior HTTP POST ──
+    // Wait for the "start" event to learn call metadata, then create a call.
+    logger.info("[bridge] Static-mode WebSocket connected (no token)", {
+      remoteIp: req.socket.remoteAddress,
+      url: req.url,
+    });
 
-      if (smartflowWs.readyState === WebSocket.OPEN || smartflowWs.readyState === WebSocket.CONNECTING) {
-        smartflowWs.close();
-      }
+    const adapter = getAdapter("smartflow");
+    let bridgeStarted = false;
+    let mulawBuffer: Buffer[] = []; // Buffer audio that arrives before bridge is up
 
-      deleteSession(token);
-    };
-
-    // ── Connect to Retell via LiveKit ──────────────────────────────────────
-    (async () => {
-      try {
-        // Create an AudioSource and local track for pushing user audio into Retell
-        audioSource = new AudioSource(SAMPLE_RATE, NUM_CHANNELS);
-        localTrack = LocalAudioTrack.createAudioTrack("user_audio", audioSource);
-
-        const publishOpts = new TrackPublishOptions();
-        publishOpts.source = TrackSource.SOURCE_MICROPHONE;
-
-        // Wire up LiveKit events before connecting
-        room.on(RoomEvent.Connected, async () => {
-          logger.info("[bridge] LiveKit room connected", {
-            retellCallId: session.retellCallId,
-            roomName: room.name,
-          });
-
-          // Publish our audio track so Retell can receive user speech
-          const pub = await room.localParticipant?.publishTrack(localTrack!, publishOpts);
-          logger.debug("[bridge] Published track sid", { sid: pub?.sid });
-          logger.info("[bridge] Published user audio track to Retell LiveKit room");
-
-          // Flush any µ-law that arrived before we connected
-          if (mulawAccum.length > 0) {
-            flushMulawToRetell(mulawAccum);
-            mulawAccum = Buffer.alloc(0);
-          }
-
-          if (adapter.onOpen) {
-            adapter.onOpen(smartflowWs, { streamSid, chunkCounter });
-          }
-        });
-
-        room.on(RoomEvent.Disconnected, () => {
-          logger.info("[bridge] LiveKit room disconnected", {
-            retellCallId: session.retellCallId,
-          });
-          cleanup("retell-livekit-disconnect");
-        });
-
-        // Subscribe to agent audio track (Retell → Smartflow)
-        room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-          if (track.kind !== TrackKind.KIND_AUDIO) return;
-          logger.info("[bridge] Subscribed to Retell agent audio track", {
-            trackName: publication.name,
-            participantIdentity: participant.identity,
-          });
-
-          // AudioStream lets us pull PCM frames from the remote track
-          const audioStream = new AudioStream(track, SAMPLE_RATE, NUM_CHANNELS);
-
-          (async () => {
-            for await (const frame of audioStream) {
-              if (smartflowWs.readyState !== WebSocket.OPEN) break;
-
-              // frame.data is Int16Array of PCM samples
-              const mulaw = pcm16BufToMulaw(frame.data as Int16Array);
-              chunkCounter++;
-
-              const encodedFrame = adapter.encodeAudio(mulaw, { streamSid, chunkCounter });
-              smartflowWs.send(encodedFrame);
-
-              if (chunkCounter === 1) {
-                logger.info("[bridge] First agent audio frame sent to vendor", {
-                  vendor: session.vendor,
-                  retellCallId: session.retellCallId,
-                  bytes: mulaw.length,
-                });
-              }
-            }
-          })().catch((err) => {
-            logger.error("[bridge] Error reading agent audio stream", { error: (err as Error).message });
-          });
-        });
-
-        // Connect to Retell's LiveKit server
-        await room.connect(RETELL_LIVEKIT_URL, session.retellAccessToken, {
-          autoSubscribe: true,
-          dynacast: false,
-        });
-
-      } catch (err) {
-        logger.error("[bridge] Failed to connect to Retell LiveKit room", {
-          retellCallId: session.retellCallId,
-          error: (err as Error).message,
-        });
-        cleanup("retell-connect-error");
-      }
-    })();
-
-    // ── Helper: push accumulated µ-law buffer to Retell as PCM frames ─────
-    const flushMulawToRetell = (buf: Buffer) => {
-      if (!audioSource) return;
-      let offset = 0;
-      while (offset + FRAME_SAMPLES <= buf.length) {
-        const chunk = buf.slice(offset, offset + FRAME_SAMPLES);
-        const pcm = mulawBufToPcm16(chunk);
-        const frame = new AudioFrame(pcm, SAMPLE_RATE, NUM_CHANNELS, FRAME_SAMPLES);
-        // captureFrame is synchronous in @livekit/rtc-node
-        audioSource.captureFrame(frame);
-        offset += FRAME_SAMPLES;
-      }
-      // Return leftover bytes
-      return buf.slice(offset);
-    };
-
-    // ── Smartflow → Retell (inbound user audio) ────────────────────────────
-    smartflowWs.on("message", (raw: WebSocket.RawData) => {
+    const staticHandler = async (raw: WebSocket.RawData) => {
       const event = adapter.decode(raw);
       if (!event) return;
 
-      switch (event.type) {
-        case "connected":
-          logger.info("[bridge] Vendor stream connected handshake", { token, vendor: session.vendor });
-          break;
-
-        case "start":
-          streamSid = event.streamSid;
-          logger.info("[bridge] Vendor stream started", {
-            vendor: session.vendor,
-            streamSid,
-            from: event.from,
-            to: event.to,
-          });
-          break;
-
-        case "audio": {
-          const incomingBuf = Buffer.isBuffer(event.payload)
-            ? event.payload
-            : Buffer.from(event.payload as string, "base64");
-
-          if (!audioSource || room.connectionState !== ConnectionState.CONN_CONNECTED) {
-            // Buffer until LiveKit room is ready
-            mulawAccum = Buffer.concat([mulawAccum, incomingBuf]);
-          } else {
-            // Prepend any buffered bytes and flush
-            const combined = mulawAccum.length > 0
-              ? Buffer.concat([mulawAccum, incomingBuf])
-              : incomingBuf;
-            const leftover = flushMulawToRetell(combined);
-            mulawAccum = leftover ?? Buffer.alloc(0);
-          }
-          break;
-        }
-
-        case "stop":
-          logger.info("[bridge] Vendor stream stop event", { vendor: session.vendor, streamSid });
-          cleanup("vendor-stop");
-          break;
+      if (event.type === "connected") {
+        logger.info("[bridge] Static-mode: connected handshake received");
+        return;
       }
-    });
 
-    // ── Socket lifecycle ───────────────────────────────────────────────────
+      if (event.type === "start" && !bridgeStarted) {
+        bridgeStarted = true;
+        const streamSid = event.streamSid;
+        const fromNumber = event.from ?? "unknown";
+        const toNumber = event.to ?? "unknown";
+        const callId = `sf-static-${uuidv4()}`;
+
+        logger.info("[bridge] Static-mode: start event — registering Retell call", {
+          callId,
+          fromNumber,
+          toNumber,
+          streamSid,
+        });
+
+        try {
+          const retellCall = await registerCall(fromNumber, toNumber, callId);
+
+          // Remove this provisional handler; runBridge attaches its own
+          smartflowWs.removeAllListeners("message");
+
+          runBridge(
+            smartflowWs,
+            retellCall.call_id,
+            retellCall.access_token,
+            "smartflow",
+            callId,
+            streamSid,
+          );
+
+          // Replay any buffered audio events into the new bridge
+          for (const buf of mulawBuffer) {
+            smartflowWs.emit("message", buf, false);
+          }
+          mulawBuffer = [];
+
+        } catch (err) {
+          logger.error("[bridge] Static-mode: failed to register Retell call", {
+            callId,
+            error: (err as Error).message,
+          });
+          smartflowWs.close(1011, "Retell registration failed");
+        }
+        return;
+      }
+
+      // Buffer audio that arrives while we're registering
+      if (event.type === "audio") {
+        const incomingBuf: Buffer = Buffer.isBuffer(event.payload)
+          ? (event.payload as Buffer)
+          : Buffer.from(event.payload as string, "base64");
+        mulawBuffer.push(incomingBuf);
+        if (mulawBuffer.length % 50 === 0) {
+          logger.debug("[bridge] Static-mode: buffered audio frames", { count: mulawBuffer.length });
+        }
+      }
+    };
+
+    smartflowWs.on("message", staticHandler);
+
     smartflowWs.on("close", (code: number, reason: Buffer) => {
-      logger.info("[bridge] Smartflow WebSocket closed", {
-        code,
-        reason: reason.toString(),
-        smartflowCallId: session.smartflowCallId,
-      });
-      cleanup("smartflow");
-    });
-
-    smartflowWs.on("error", (err: Error) => {
-      logger.error("[bridge] Smartflow WebSocket error", {
-        smartflowCallId: session.smartflowCallId,
-        error: err.message,
-      });
-      cleanup("smartflow-error");
+      if (!bridgeStarted) {
+        logger.info("[bridge] Static-mode: WS closed before bridge started", {
+          code,
+          reason: reason.toString(),
+        });
+      }
     });
   });
 
-  logger.info("[bridge] WebSocket bridge attached at /stream (LiveKit mode)");
+  logger.info("[bridge] WebSocket bridge attached at /stream (LiveKit mode — static+token)");
   return wss;
 }
