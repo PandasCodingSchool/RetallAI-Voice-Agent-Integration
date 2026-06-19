@@ -149,7 +149,7 @@ function runBridge(
   // ── Connect to Retell via LiveKit ────────────────────────────────────────
   (async () => {
     try {
-      audioSource = new AudioSource(SAMPLE_RATE, NUM_CHANNELS);
+      audioSource = new AudioSource(24000, NUM_CHANNELS);
       localTrack = LocalAudioTrack.createAudioTrack("user_audio", audioSource);
 
       const publishOpts = new TrackPublishOptions();
@@ -187,18 +187,28 @@ function runBridge(
 
         const audioStream = new AudioStream(track, SAMPLE_RATE, NUM_CHANNELS);
         (async () => {
+          let outboundAccum = Buffer.alloc(0);
           for await (const frame of audioStream) {
             if (smartflowWs.readyState !== WebSocket.OPEN) break;
             const mulaw = pcm16BufToMulaw(frame.data as Int16Array);
-            chunkCounter++;
-            const encodedFrame = adapter.encodeAudio(mulaw, { streamSid, chunkCounter });
-            smartflowWs.send(encodedFrame);
-            if (chunkCounter === 1) {
-              logger.info("[bridge] First agent audio frame sent to vendor", {
-                vendor,
-                retellCallId,
-                bytes: mulaw.length,
-              });
+            outboundAccum = Buffer.concat([outboundAccum, mulaw]);
+            
+            // Send in 20ms (160 bytes) chunks to prevent WebSocket lag
+            while (outboundAccum.length >= 160) {
+              const chunk = outboundAccum.slice(0, 160);
+              outboundAccum = Buffer.from(outboundAccum.buffer, outboundAccum.byteOffset + 160, outboundAccum.byteLength - 160);
+              
+              chunkCounter++;
+              const encodedFrame = adapter.encodeAudio(chunk, { streamSid, chunkCounter });
+              smartflowWs.send(encodedFrame);
+              
+              if (chunkCounter === 1) {
+                logger.info("[bridge] First agent audio frame sent to vendor", {
+                  vendor,
+                  retellCallId,
+                  bytes: chunk.length,
+                });
+              }
             }
           }
         })().catch((err) => {
