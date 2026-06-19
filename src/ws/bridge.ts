@@ -254,6 +254,14 @@ function runBridge(
           ? (event.payload as Buffer)
           : Buffer.from(event.payload as string, "base64");
 
+        if (chunkCounter < 10) {
+          logger.debug("[bridge] Incoming Smartflow audio buffer snippet", {
+            chunkCounter,
+            length: incomingBuf.length,
+            hex: incomingBuf.toString("hex").substring(0, 32)
+          });
+        }
+
         mulawAccum = Buffer.concat([mulawAccum, incomingBuf]);
         processAudioQueue();
         break;
