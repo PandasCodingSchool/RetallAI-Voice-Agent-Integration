@@ -115,17 +115,35 @@ function runBridge(
   };
 
   // ── Helper: push µ-law buffer to Retell as 20ms PCM frames ──────────────
-  const flushMulawToRetell = (buf: Buffer): Buffer => {
-    if (!audioSource) return buf;
-    let offset = 0;
-    while (offset + FRAME_SAMPLES <= buf.length) {
-      const chunk = buf.slice(offset, offset + FRAME_SAMPLES);
-      const pcm = mulawBufToPcm16(chunk);
-      const frame = new AudioFrame(pcm, SAMPLE_RATE, NUM_CHANNELS, FRAME_SAMPLES);
-      audioSource.captureFrame(frame);
-      offset += FRAME_SAMPLES;
+  let isFlushing = false;
+  const processAudioQueue = async () => {
+    if (isFlushing || !audioSource || room.connectionState !== ConnectionState.CONN_CONNECTED) return;
+    isFlushing = true;
+    try {
+      while (mulawAccum.length >= FRAME_SAMPLES) {
+        if (smartflowWs.readyState !== WebSocket.OPEN) break;
+        
+        const chunk = mulawAccum.slice(0, FRAME_SAMPLES);
+        // Remove processed chunk from accumulator
+        mulawAccum = Buffer.from(mulawAccum.buffer, mulawAccum.byteOffset + FRAME_SAMPLES, mulawAccum.byteLength - FRAME_SAMPLES);
+        
+        // Upsample 8000Hz to 24000Hz (3x)
+        const pcm24k = new Int16Array(FRAME_SAMPLES * 3);
+        for (let i = 0; i < FRAME_SAMPLES; i++) {
+          const sample = mulawToPcm16(chunk[i]);
+          pcm24k[i * 3] = sample;
+          pcm24k[i * 3 + 1] = sample;
+          pcm24k[i * 3 + 2] = sample;
+        }
+        
+        const frame = new AudioFrame(pcm24k, 24000, NUM_CHANNELS, FRAME_SAMPLES * 3);
+        await audioSource.captureFrame(frame);
+      }
+    } catch (err) {
+      logger.error("[bridge] Audio queue error", { error: (err as Error).message });
+    } finally {
+      isFlushing = false;
     }
-    return Buffer.from(buf.buffer, buf.byteOffset + offset, buf.byteLength - offset);
   };
 
   // ── Connect to Retell via LiveKit ────────────────────────────────────────
@@ -146,7 +164,7 @@ function runBridge(
 
         // Flush buffered audio that arrived before LiveKit connected
         if (mulawAccum.length > 0) {
-          mulawAccum = flushMulawToRetell(mulawAccum);
+          processAudioQueue();
         }
 
         if (adapter.onOpen) {
@@ -222,14 +240,8 @@ function runBridge(
           ? (event.payload as Buffer)
           : Buffer.from(event.payload as string, "base64");
 
-        if (!audioSource || room.connectionState !== ConnectionState.CONN_CONNECTED) {
-          mulawAccum = Buffer.concat([mulawAccum, incomingBuf]);
-        } else {
-          const combined = mulawAccum.length > 0
-            ? Buffer.concat([mulawAccum, incomingBuf])
-            : incomingBuf;
-          mulawAccum = flushMulawToRetell(combined);
-        }
+        mulawAccum = Buffer.concat([mulawAccum, incomingBuf]);
+        processAudioQueue();
         break;
       }
 
