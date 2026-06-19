@@ -12,6 +12,7 @@
     "simulate:static": "ts-node test/simulate-static-smartflow.ts"
   },
   "dependencies": {
+    "@livekit/rtc-node": "^0.13.29",
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

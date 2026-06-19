@@ -6,11 +6,7 @@ const RETELL_API_BASE = "https://api.retellai.com";
 
 export interface RegisterCallResponse {
   call_id: string;
-  access_token?: string;
-  call_status?: string;
-  audio_websocket_protocol?: string;
-  audio_encoding?: string;
-  sample_rate?: number;
+  access_token: string;
 }
 
 export async function registerCall(
@@ -18,19 +14,15 @@ export async function registerCall(
   toNumber: string,
   smartflowCallId: string,
 ): Promise<RegisterCallResponse> {
-  const url = `${RETELL_API_BASE}/v2/register-phone-call`;
+  const url = `${RETELL_API_BASE}/v2/create-web-call`;
 
   const payload = {
     agent_id: config.retellAgentId,
-    from_number: fromNumber,
-    to_number: toNumber,
     metadata: {
       smartflow_call_id: smartflowCallId,
+      from_number: fromNumber,
+      to_number: toNumber,
     },
-    // Use native telephony format - Smartflow sends µ-law 8kHz like Twilio
-    audio_encoding: "mulaw",
-    sample_rate: 8000,
-    audio_websocket_protocol: "web",
   };
 
   logger.info("Registering call with Retell AI", {
@@ -38,8 +30,7 @@ export async function registerCall(
     fromNumber,
     toNumber,
     url,
-    registrationMode: "phone_call",
-    audioWebsocketProtocol: payload.audio_websocket_protocol,
+    registrationMode: "web_call",
   });
 
   let response;
@@ -67,10 +58,6 @@ export async function registerCall(
   logger.info("Retell call registered", {
     smartflowCallId,
     retellCallId: response.data.call_id,
-    callStatus: response.data.call_status,
-    audioWebsocketProtocol: response.data.audio_websocket_protocol,
-    audioEncoding: response.data.audio_encoding,
-    sampleRate: response.data.sample_rate,
     hasAccessToken: !!response.data.access_token,
   });
 

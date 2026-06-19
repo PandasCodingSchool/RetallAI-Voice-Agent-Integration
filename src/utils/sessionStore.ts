@@ -6,7 +6,7 @@ import { VendorName } from "../adapters";
 export interface Session {
   smartflowCallId: string;
   retellCallId: string;
-  retellAccessToken?: string;
+  retellAccessToken: string;
   vendor: VendorName;
   createdAt: Date;
   smartflowWs?: WebSocket;
