@@ -12,12 +12,15 @@ import {
   TrackPublishOptions,
   TrackSource,
   ConnectionState,
+  AudioFrame,
+  AudioResampler,
+  AudioResamplerQuality,
 } from "@livekit/rtc-node";
 import { getSession, deleteSession } from "../utils/sessionStore";
 import { registerCall } from "../services/retellService";
 import { logger } from "../utils/logger";
 import { getAdapter } from "../adapters";
-import { AudioFrame } from "@livekit/rtc-node";
+
 
 // Retell AI's LiveKit server — discovered from retell-client-js-sdk source
 const RETELL_LIVEKIT_URL = "wss://retell-ai-4ihahnq7.livekit.cloud";
@@ -86,6 +89,7 @@ function runBridge(
   let audioSource: AudioSource | null = null;
   let localTrack: LocalAudioTrack | null = null;
   let publishedTrackSid: string | undefined;
+  let audioResampler: AudioResampler | null = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let mulawAccum: any = Buffer.alloc(0);
 
@@ -106,6 +110,13 @@ function runBridge(
       if (publishedTrackSid) await room.localParticipant?.unpublishTrack(publishedTrackSid);
       await room.disconnect();
     } catch { /* best-effort */ }
+
+    if (audioResampler) {
+      try {
+        audioResampler.close();
+      } catch { /* best-effort */ }
+      audioResampler = null;
+    }
 
     if (smartflowWs.readyState === WebSocket.OPEN || smartflowWs.readyState === WebSocket.CONNECTING) {
       smartflowWs.close(1000, "call ended");
@@ -133,9 +144,6 @@ function runBridge(
         // Remove processed chunk from accumulator
         mulawAccum = Buffer.from(mulawAccum.buffer, mulawAccum.byteOffset + FRAME_SAMPLES, mulawAccum.byteLength - FRAME_SAMPLES);
         
-        // Send 8000Hz directly: let WebRTC's internal C++ stack handle the resampling to Opus,
-        // which avoids the severe high-frequency aliasing artifacts of manual linear interpolation.
-        // Those artifacts were causing the VAD engine to treat the signal as continuous noise.
         const pcm8k = new Int16Array(FRAME_SAMPLES);
         let rmsSum = 0;
         for (let i = 0; i < FRAME_SAMPLES; i++) {
@@ -157,8 +165,13 @@ function runBridge(
           debugFrameCount++;
         }
         
-        const frame = new AudioFrame(pcm8k, 8000, NUM_CHANNELS, FRAME_SAMPLES);
-        await audioSource.captureFrame(frame);
+        if (audioResampler) {
+          const frame8k = new AudioFrame(pcm8k, 8000, NUM_CHANNELS, FRAME_SAMPLES);
+          const resampledFrames = audioResampler.push(frame8k);
+          for (const outFrame of resampledFrames) {
+            await audioSource.captureFrame(outFrame);
+          }
+        }
       }
     } catch (err) {
       logger.error("[bridge] Audio queue error", { error: (err as Error).message });
@@ -170,7 +183,9 @@ function runBridge(
   // ── Connect to Retell via LiveKit ────────────────────────────────────────
   (async () => {
     try {
-      audioSource = new AudioSource(8000, NUM_CHANNELS);
+      audioResampler = new AudioResampler(8000, 48000, NUM_CHANNELS, AudioResamplerQuality.HIGH);
+      logger.info("[bridge] AudioResampler initialized (8000Hz -> 48000Hz)");
+      audioSource = new AudioSource(48000, NUM_CHANNELS);
       localTrack = LocalAudioTrack.createAudioTrack("microphone", audioSource);
 
       const publishOpts = new TrackPublishOptions();
