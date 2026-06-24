@@ -133,24 +133,16 @@ function runBridge(
         // Remove processed chunk from accumulator
         mulawAccum = Buffer.from(mulawAccum.buffer, mulawAccum.byteOffset + FRAME_SAMPLES, mulawAccum.byteLength - FRAME_SAMPLES);
         
-        // Linear Interpolation: smoothly upsample 8000Hz to 48000Hz (6x)
-        // LibOpus (used by LiveKit rtc-node) works in 'fullband' mode at 48kHz,
-        // which is what Retell's VAD engine expects from WebRTC microphone input.
-        const UPSAMPLE = 6;
-        const pcm48k = new Int16Array(FRAME_SAMPLES * UPSAMPLE);
+        // Send 8000Hz directly: let WebRTC's internal C++ stack handle the resampling to Opus,
+        // which avoids the severe high-frequency aliasing artifacts of manual linear interpolation.
+        // Those artifacts were causing the VAD engine to treat the signal as continuous noise.
+        const pcm8k = new Int16Array(FRAME_SAMPLES);
         let rmsSum = 0;
         for (let i = 0; i < FRAME_SAMPLES; i++) {
-          const raw1 = mulawToPcm16(chunk[i]);
-          const raw2 = i + 1 < FRAME_SAMPLES ? mulawToPcm16(chunk[i + 1]) : raw1;
-
-          // Apply gain and clamp to int16 range
-          const s1 = Math.max(-32768, Math.min(32767, raw1 * GAIN));
-          const s2 = Math.max(-32768, Math.min(32767, raw2 * GAIN));
-          rmsSum += s1 * s1;
-
-          for (let j = 0; j < UPSAMPLE; j++) {
-            pcm48k[i * UPSAMPLE + j] = Math.floor(s1 + (s2 - s1) * (j / UPSAMPLE));
-          }
+          const raw = mulawToPcm16(chunk[i]);
+          const s = Math.max(-32768, Math.min(32767, raw * GAIN));
+          rmsSum += s * s;
+          pcm8k[i] = s;
         }
 
         // Log RMS of first 20 frames sent to Retell for diagnostics
@@ -160,12 +152,12 @@ function runBridge(
             frame: debugFrameCount,
             rms: Math.round(rms),
             gain: GAIN,
-            sampleRate: 48000,
+            sampleRate: 8000,
           });
           debugFrameCount++;
         }
         
-        const frame = new AudioFrame(pcm48k, 48000, NUM_CHANNELS, FRAME_SAMPLES * UPSAMPLE);
+        const frame = new AudioFrame(pcm8k, 8000, NUM_CHANNELS, FRAME_SAMPLES);
         await audioSource.captureFrame(frame);
       }
     } catch (err) {
@@ -178,7 +170,7 @@ function runBridge(
   // ── Connect to Retell via LiveKit ────────────────────────────────────────
   (async () => {
     try {
-      audioSource = new AudioSource(48000, NUM_CHANNELS);
+      audioSource = new AudioSource(8000, NUM_CHANNELS);
       localTrack = LocalAudioTrack.createAudioTrack("microphone", audioSource);
 
       const publishOpts = new TrackPublishOptions();
