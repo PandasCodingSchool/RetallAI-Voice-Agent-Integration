@@ -92,6 +92,14 @@ function runBridge(
   let audioResampler: AudioResampler | null = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let mulawAccum: any = Buffer.alloc(0);
+  let resampledAccum: any = new Int16Array(0);
+
+  const appendToInt16Array = (arr1: any, arr2: any): Int16Array => {
+    const res = new Int16Array(arr1.length + arr2.length);
+    res.set(arr1, 0);
+    res.set(arr2, arr1.length);
+    return res;
+  };
 
   // ── Cleanup ──────────────────────────────────────────────────────────────
   const cleanup = async (source: string) => {
@@ -140,9 +148,9 @@ function runBridge(
       while (mulawAccum.length >= FRAME_SAMPLES) {
         if (smartflowWs.readyState !== WebSocket.OPEN) break;
         
-        const chunk = mulawAccum.slice(0, FRAME_SAMPLES);
+        const chunk = mulawAccum.subarray(0, FRAME_SAMPLES);
         // Remove processed chunk from accumulator
-        mulawAccum = Buffer.from(mulawAccum.buffer, mulawAccum.byteOffset + FRAME_SAMPLES, mulawAccum.byteLength - FRAME_SAMPLES);
+        mulawAccum = mulawAccum.subarray(FRAME_SAMPLES);
         
         const pcm8k = new Int16Array(FRAME_SAMPLES);
         let rmsSum = 0;
@@ -169,7 +177,17 @@ function runBridge(
           const frame8k = new AudioFrame(pcm8k, 8000, NUM_CHANNELS, FRAME_SAMPLES);
           const resampledFrames = audioResampler.push(frame8k);
           for (const outFrame of resampledFrames) {
-            await audioSource.captureFrame(outFrame);
+            resampledAccum = appendToInt16Array(resampledAccum, outFrame.data as Int16Array);
+          }
+
+          const TARGET_SAMPLES = 960; // 20ms @ 48000Hz
+          while (resampledAccum.length >= TARGET_SAMPLES) {
+            const pcmChunk = resampledAccum.subarray(0, TARGET_SAMPLES);
+            const framePcm = new Int16Array(pcmChunk); // copy to fresh memory
+            resampledAccum = resampledAccum.subarray(TARGET_SAMPLES);
+
+            const frame48k = new AudioFrame(framePcm, 48000, NUM_CHANNELS, TARGET_SAMPLES);
+            await audioSource.captureFrame(frame48k);
           }
         }
       }
@@ -232,8 +250,8 @@ function runBridge(
             
             // Send in 20ms (160 bytes) chunks to prevent WebSocket lag
             while (outboundAccum.length >= 160) {
-              const chunk = outboundAccum.slice(0, 160);
-              outboundAccum = Buffer.from(outboundAccum.buffer, outboundAccum.byteOffset + 160, outboundAccum.byteLength - 160);
+              const chunk = outboundAccum.subarray(0, 160);
+              outboundAccum = outboundAccum.subarray(160);
               
               chunkCounter++;
               const encodedFrame = adapter.encodeAudio(chunk, { streamSid, chunkCounter });
