@@ -31,11 +31,13 @@ export class SmartflowAdapter implements IVendorAdapter {
         return { type: "connected" };
 
       case "start":
+        console.log("[SmartflowAdapter] Received start event frame:", JSON.stringify(frame));
         return {
           type: "start",
           streamSid: frame.streamSid ?? frame.start?.streamSid ?? "",
           from: frame.start?.from ?? "",
           to: frame.start?.to ?? "",
+          mediaFormat: frame.start?.mediaFormat,
         };
 
       case "media": {

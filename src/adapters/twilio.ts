@@ -38,6 +38,7 @@ export class TwilioAdapter implements IVendorAdapter {
           streamSid: frame.streamSid ?? frame.start?.streamSid ?? "",
           from: frame.start?.customParameters?.["from"] ?? "",
           to: frame.start?.customParameters?.["to"] ?? "",
+          mediaFormat: frame.start?.mediaFormat,
         };
 
       case "media": {

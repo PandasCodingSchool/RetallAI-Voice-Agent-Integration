@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@livekit/rtc-node": "^0.13.29",
+    "alawmulaw": "^6.0.0",
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

@@ -20,50 +20,26 @@ import { getSession, deleteSession } from "../utils/sessionStore";
 import { registerCall } from "../services/retellService";
 import { logger } from "../utils/logger";
 import { getAdapter } from "../adapters";
+import { alaw, mulaw } from "alawmulaw";
 
 
 // Retell AI's LiveKit server — discovered from retell-client-js-sdk source
 const RETELL_LIVEKIT_URL = "wss://retell-ai-4ihahnq7.livekit.cloud";
 
-// Smartflow sends µ-law 8 kHz mono
+// Smartflow sends µ-law or A-law 8 kHz mono
 const SAMPLE_RATE = 8000;
 const NUM_CHANNELS = 1;
 // 20 ms frames — 160 samples @ 8 kHz
 const FRAME_SAMPLES = 160;
 
-/** Decode µ-law byte → 16-bit PCM sample (ITU-T G.711) */
-function mulawToPcm16(mulaw: number): number {
-  mulaw = ~mulaw & 0xff;
-  const sign = mulaw & 0x80 ? -1 : 1;
-  const exponent = (mulaw >> 4) & 0x07;
-  const mantissa = mulaw & 0x0f;
-  const sample = sign * ((mantissa << (exponent + 3)) + (0x84 << exponent) - 0x84);
-  return Math.max(-32768, Math.min(32767, sample));
-}
-
-/** Encode 16-bit PCM sample → µ-law byte */
-function pcm16ToMulaw(sample: number): number {
-  const BIAS = 0x84;
-  const sign = sample < 0 ? 0x80 : 0x00;
-  let s = Math.abs(sample);
-  if (s > 32767) s = 32767;
-  s += BIAS;
-  let exponent = 7;
-  for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
-  const mantissa = (s >> (exponent + 3)) & 0x0f;
-  return ~(sign | (exponent << 4) | mantissa) & 0xff;
-}
-
-function mulawBufToPcm16(buf: Buffer): Int16Array {
-  const out = new Int16Array(buf.length);
-  for (let i = 0; i < buf.length; i++) out[i] = mulawToPcm16(buf[i]);
-  return out;
-}
-
-function pcm16BufToMulaw(samples: Int16Array): Buffer {
-  const out = Buffer.allocUnsafe(samples.length);
-  for (let i = 0; i < samples.length; i++) out[i] = pcm16ToMulaw(samples[i]);
-  return out;
+function getCodecFromMediaFormat(mediaFormat?: { encoding?: string }): "mulaw" | "alaw" {
+  if (mediaFormat && typeof mediaFormat.encoding === "string") {
+    const enc = mediaFormat.encoding.toLowerCase();
+    if (enc.includes("alaw") || enc.includes("pcma") || enc.includes("a-law")) {
+      return "alaw";
+    }
+  }
+  return "mulaw";
 }
 
 /**
@@ -78,12 +54,14 @@ function runBridge(
   vendor: string,
   smartflowCallId: string,
   initialStreamSid: string,
+  initialCodec?: "mulaw" | "alaw",
   onCleanup?: () => void,
 ): void {
   const adapter = getAdapter(vendor);
   let streamSid = initialStreamSid;
   let chunkCounter = 0;
   let cleanupCalled = false;
+  let codec: "mulaw" | "alaw" = initialCodec || "mulaw";
 
   const room = new Room();
   let audioSource: AudioSource | null = null;
@@ -133,12 +111,13 @@ function runBridge(
     onCleanup?.();
   };
 
-  // ── Audio gain: telephony codecs (G.711 µ-law) use low signal levels.
-  // Retell's WebRTC VAD/STT requires a much higher amplitude to detect speech.
-  // We apply a gain of 20x (26dB), clamped to int16 range, before sending.
-  const GAIN = 20;
+  // ── Audio gain: telephony codecs use low signal levels.
+  // Retell's WebRTC VAD/STT requires proper amplitude to detect speech.
+  // We make the gain configurable via process.env.AUDIO_GAIN.
+  // Default is 1.0 (no gain) which is correct for properly decoded PCM, but can be overridden.
+  const GAIN = process.env.AUDIO_GAIN ? parseFloat(process.env.AUDIO_GAIN) : 1.0;
 
-  // ── Helper: push µ-law buffer to Retell as 20ms PCM frames ──────────────
+  // ── Helper: push buffer to Retell as 20ms PCM frames ─────────────────────
   let isFlushing = false;
   let debugFrameCount = 0;
   const processAudioQueue = async () => {
@@ -152,11 +131,16 @@ function runBridge(
         // Remove processed chunk from accumulator
         mulawAccum = mulawAccum.subarray(FRAME_SAMPLES);
         
-        const pcm8k = new Int16Array(FRAME_SAMPLES);
+        let pcm8k: Int16Array;
+        if (codec === "alaw") {
+          pcm8k = alaw.decode(chunk);
+        } else {
+          pcm8k = mulaw.decode(chunk);
+        }
+        
         let rmsSum = 0;
         for (let i = 0; i < FRAME_SAMPLES; i++) {
-          const raw = mulawToPcm16(chunk[i]);
-          const s = Math.max(-32768, Math.min(32767, raw * GAIN));
+          const s = Math.max(-32768, Math.min(32767, pcm8k[i] * GAIN));
           rmsSum += s * s;
           pcm8k[i] = s;
         }
@@ -169,6 +153,7 @@ function runBridge(
             rms: Math.round(rms),
             gain: GAIN,
             sampleRate: 8000,
+            codec: codec,
           });
           debugFrameCount++;
         }
@@ -245,8 +230,15 @@ function runBridge(
           let outboundAccum = Buffer.alloc(0);
           for await (const frame of audioStream) {
             if (smartflowWs.readyState !== WebSocket.OPEN) break;
-            const mulaw = pcm16BufToMulaw(frame.data as Int16Array);
-            outboundAccum = Buffer.concat([outboundAccum, mulaw]);
+            
+            let encoded: Uint8Array;
+            if (codec === "alaw") {
+              encoded = alaw.encode(frame.data as Int16Array);
+            } else {
+              encoded = mulaw.encode(frame.data as Int16Array);
+            }
+            const encodedBuf = Buffer.from(encoded.buffer, encoded.byteOffset, encoded.byteLength);
+            outboundAccum = Buffer.concat([outboundAccum, encodedBuf]);
             
             // Send in 20ms (160 bytes) chunks to prevent WebSocket lag
             while (outboundAccum.length >= 160) {
@@ -310,7 +302,17 @@ function runBridge(
 
       case "start":
         streamSid = event.streamSid;
-        logger.info("[bridge] Vendor stream started", { vendor, streamSid, from: event.from, to: event.to });
+        logger.info("[bridge] Vendor stream started", {
+          vendor,
+          streamSid,
+          from: event.from,
+          to: event.to,
+          mediaFormat: event.mediaFormat,
+        });
+        if (event.mediaFormat) {
+          codec = getCodecFromMediaFormat(event.mediaFormat);
+          logger.info(`[bridge] Switched codec to ${codec} based on start event mediaFormat`);
+        }
         break;
 
       case "audio": {
@@ -378,6 +380,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
         session.vendor,
         session.smartflowCallId,
         "",
+        undefined,
         () => deleteSession(token),
       );
       return;
@@ -423,6 +426,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
           // Remove this provisional handler; runBridge attaches its own
           smartflowWs.removeAllListeners("message");
 
+          const initialCodec = getCodecFromMediaFormat(event.mediaFormat);
           runBridge(
             smartflowWs,
             retellCall.call_id,
@@ -430,6 +434,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
             "smartflow",
             callId,
             streamSid,
+            initialCodec,
           );
 
           // Replay any buffered audio events into the new bridge

@@ -4,7 +4,7 @@ export type VendorName = "smartflow" | "twilio" | "generic";
 
 export type NormalisedEvent =
   | { type: "connected" }
-  | { type: "start"; streamSid: string; from: string; to: string }
+  | { type: "start"; streamSid: string; from: string; to: string; mediaFormat?: { encoding: string; sampleRate: number } }
   | { type: "audio"; payload: Buffer }
   | { type: "stop"; reason?: string };
 
