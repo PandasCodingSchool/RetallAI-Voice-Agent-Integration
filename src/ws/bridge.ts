@@ -133,9 +133,11 @@ function runBridge(
         // Remove processed chunk from accumulator
         mulawAccum = Buffer.from(mulawAccum.buffer, mulawAccum.byteOffset + FRAME_SAMPLES, mulawAccum.byteLength - FRAME_SAMPLES);
         
-        // Linear Interpolation: smoothly upsample 8000Hz to 24000Hz (3x)
-        // Apply GAIN to ensure Retell's VAD engine can detect speech.
-        const pcm24k = new Int16Array(FRAME_SAMPLES * 3);
+        // Linear Interpolation: smoothly upsample 8000Hz to 48000Hz (6x)
+        // LibOpus (used by LiveKit rtc-node) works in 'fullband' mode at 48kHz,
+        // which is what Retell's VAD engine expects from WebRTC microphone input.
+        const UPSAMPLE = 6;
+        const pcm48k = new Int16Array(FRAME_SAMPLES * UPSAMPLE);
         let rmsSum = 0;
         for (let i = 0; i < FRAME_SAMPLES; i++) {
           const raw1 = mulawToPcm16(chunk[i]);
@@ -146,9 +148,9 @@ function runBridge(
           const s2 = Math.max(-32768, Math.min(32767, raw2 * GAIN));
           rmsSum += s1 * s1;
 
-          pcm24k[i * 3]     = s1;
-          pcm24k[i * 3 + 1] = Math.floor(s1 + (s2 - s1) * 0.3333);
-          pcm24k[i * 3 + 2] = Math.floor(s1 + (s2 - s1) * 0.6667);
+          for (let j = 0; j < UPSAMPLE; j++) {
+            pcm48k[i * UPSAMPLE + j] = Math.floor(s1 + (s2 - s1) * (j / UPSAMPLE));
+          }
         }
 
         // Log RMS of first 20 frames sent to Retell for diagnostics
@@ -158,11 +160,12 @@ function runBridge(
             frame: debugFrameCount,
             rms: Math.round(rms),
             gain: GAIN,
+            sampleRate: 48000,
           });
           debugFrameCount++;
         }
         
-        const frame = new AudioFrame(pcm24k, 24000, NUM_CHANNELS, FRAME_SAMPLES * 3);
+        const frame = new AudioFrame(pcm48k, 48000, NUM_CHANNELS, FRAME_SAMPLES * UPSAMPLE);
         await audioSource.captureFrame(frame);
       }
     } catch (err) {
@@ -175,7 +178,7 @@ function runBridge(
   // ── Connect to Retell via LiveKit ────────────────────────────────────────
   (async () => {
     try {
-      audioSource = new AudioSource(24000, NUM_CHANNELS);
+      audioSource = new AudioSource(48000, NUM_CHANNELS);
       localTrack = LocalAudioTrack.createAudioTrack("user_audio", audioSource);
 
       const publishOpts = new TrackPublishOptions();
