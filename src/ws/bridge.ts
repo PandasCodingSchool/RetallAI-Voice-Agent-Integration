@@ -179,7 +179,7 @@ function runBridge(
   (async () => {
     try {
       audioSource = new AudioSource(48000, NUM_CHANNELS);
-      localTrack = LocalAudioTrack.createAudioTrack("user_audio", audioSource);
+      localTrack = LocalAudioTrack.createAudioTrack("microphone", audioSource);
 
       const publishOpts = new TrackPublishOptions();
       publishOpts.source = TrackSource.SOURCE_MICROPHONE;
@@ -244,6 +244,19 @@ function runBridge(
         })().catch((err) => {
           logger.error("[bridge] Error reading agent audio stream", { error: (err as Error).message });
         });
+      });
+
+      // ── Listen for Retell data channel events (transcripts, node transitions) ──
+      room.on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+        try {
+          const str = new TextDecoder().decode(payload);
+          const data = JSON.parse(str);
+          if (data.event_type === "update" || data.event_type === "node_transition") {
+            logger.info("[Retell LiveKit Data]", { event_type: data.event_type, data: data });
+          }
+        } catch (e) {
+          logger.debug("Could not parse LiveKit data payload");
+        }
       });
 
       await room.connect(RETELL_LIVEKIT_URL, retellAccessToken, {
