@@ -203,36 +203,41 @@ function runBridge(
       publishOpts.source = TrackSource.SOURCE_MICROPHONE;
       publishOpts.dtx = false; // Disable Discontinuous Transmission to prevent aggressive WebRTC VAD dropping
 
-      room.on(RoomEvent.Connected, async () => {
-        logger.info("[bridge] LiveKit room connected", { retellCallId, roomName: room.name });
-
+      // RoomEvent.Connected does not reliably fire in @livekit/rtc-node even when
+      // room.connectionState === CONN_CONNECTED (native layer connects but JS event is missed).
+      // This helper is called both from the event handler (if it fires) and directly after
+      // room.connect() resolves, so publishTrack always executes.
+      const publishTrackIfNeeded = async (trigger: string) => {
+        if (publishedTrackSid) return;
+        if (!room.localParticipant) {
+          logger.error("[bridge] CRITICAL: localParticipant is null", { retellCallId, trigger });
+          cleanup("no-local-participant");
+          return;
+        }
         try {
-          if (!room.localParticipant) {
-            throw new Error("localParticipant is null after Connected event");
-          }
           const pub = await room.localParticipant.publishTrack(localTrack!, publishOpts);
           publishedTrackSid = pub?.sid;
           logger.info("[bridge] Published user audio track to Retell LiveKit room", {
             retellCallId,
             trackSid: publishedTrackSid,
+            trigger,
           });
         } catch (err) {
           logger.error("[bridge] CRITICAL: failed to publish audio track to Retell", {
             retellCallId,
+            trigger,
             error: (err as Error).message,
           });
           cleanup("publish-track-failed");
           return;
         }
+        if (mulawAccum.length > 0) processAudioQueue();
+        if (adapter.onOpen) adapter.onOpen(smartflowWs, { streamSid, chunkCounter });
+      };
 
-        // Flush buffered audio that arrived before LiveKit connected
-        if (mulawAccum.length > 0) {
-          processAudioQueue();
-        }
-
-        if (adapter.onOpen) {
-          adapter.onOpen(smartflowWs, { streamSid, chunkCounter });
-        }
+      room.on(RoomEvent.Connected, async () => {
+        logger.info("[bridge] LiveKit room connected (via event)", { retellCallId, roomName: room.name });
+        await publishTrackIfNeeded("Connected-event");
       });
 
       room.on(RoomEvent.Disconnected, () => {
@@ -303,6 +308,21 @@ function runBridge(
         autoSubscribe: true,
         dynacast: false,
       });
+
+      // room.connect() resolves once the native layer is connected.
+      // Publish the track immediately here in case RoomEvent.Connected never fires.
+      logger.info("[bridge] room.connect() resolved", {
+        retellCallId,
+        connectionState: room.connectionState,
+      });
+      if (room.connectionState === ConnectionState.CONN_CONNECTED) {
+        await publishTrackIfNeeded("post-connect");
+      } else {
+        logger.warn("[bridge] room.connect() resolved but state is not CONN_CONNECTED", {
+          retellCallId,
+          connectionState: room.connectionState,
+        });
+      }
 
     } catch (err) {
       logger.error("[bridge] Failed to connect to Retell LiveKit room", {
