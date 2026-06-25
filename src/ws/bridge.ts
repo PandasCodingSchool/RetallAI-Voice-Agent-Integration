@@ -119,53 +119,57 @@ function runBridge(
 
   // ── Helper: push buffer to Retell as 20ms PCM frames ─────────────────────
   let isFlushing = false;
+  let pendingDrain = false;
   let debugFrameCount = 0;
+  const TARGET_SAMPLES = 960; // 20ms @ 48000Hz
   const processAudioQueue = async () => {
-    if (isFlushing || !audioSource || room.connectionState !== ConnectionState.CONN_CONNECTED) return;
+    if (isFlushing) {
+      // Another drain is running; mark that more data arrived so it re-drains after finishing
+      pendingDrain = true;
+      return;
+    }
+    if (!audioSource || room.connectionState !== ConnectionState.CONN_CONNECTED) return;
     isFlushing = true;
+    pendingDrain = false;
     try {
       while (mulawAccum.length >= FRAME_SAMPLES) {
         if (smartflowWs.readyState !== WebSocket.OPEN) break;
-        
+
         const chunk = mulawAccum.subarray(0, FRAME_SAMPLES);
-        // Remove processed chunk from accumulator
         mulawAccum = mulawAccum.subarray(FRAME_SAMPLES);
-        
+
         let pcm8k: Int16Array;
         if (codec === "alaw") {
           pcm8k = alaw.decode(chunk);
         } else {
           pcm8k = mulaw.decode(chunk);
         }
-        
-        let rmsSum = 0;
-        for (let i = 0; i < FRAME_SAMPLES; i++) {
-          const s = Math.max(-32768, Math.min(32767, pcm8k[i] * GAIN));
-          rmsSum += s * s;
-          pcm8k[i] = s;
+
+        if (GAIN !== 1.0) {
+          for (let i = 0; i < FRAME_SAMPLES; i++) {
+            pcm8k[i] = Math.max(-32768, Math.min(32767, pcm8k[i] * GAIN));
+          }
         }
 
-        const rms = Math.sqrt(rmsSum / FRAME_SAMPLES);
-        // Always log the first non-silent frame to confirm caller audio arrives
-        if (debugFrameCount === 0 && rms > 0) {
-          logger.info("[bridge] First non-silent inbound audio frame from caller", {
-            frame: debugFrameCount,
-            rms: Math.round(rms),
-            codec: codec,
-          });
+        if (debugFrameCount === 0) {
+          let rmsSum = 0;
+          for (let i = 0; i < FRAME_SAMPLES; i++) rmsSum += pcm8k[i] * pcm8k[i];
+          const rms = Math.sqrt(rmsSum / FRAME_SAMPLES);
+          if (rms > 0) {
+            logger.info("[bridge] First non-silent inbound audio frame from caller", {
+              frame: debugFrameCount, rms: Math.round(rms), codec,
+            });
+          }
         }
-        // Log first 20 frames for baseline, then every 50th frame for ongoing visibility
         if (debugFrameCount < 20 || debugFrameCount % 50 === 0) {
-          logger.debug("[bridge] Inbound audio frame RMS (after gain)", {
-            frame: debugFrameCount,
-            rms: Math.round(rms),
-            gain: GAIN,
-            sampleRate: 8000,
-            codec: codec,
+          let rmsSum = 0;
+          for (let i = 0; i < FRAME_SAMPLES; i++) rmsSum += pcm8k[i] * pcm8k[i];
+          logger.debug("[bridge] Inbound audio frame RMS", {
+            frame: debugFrameCount, rms: Math.round(Math.sqrt(rmsSum / FRAME_SAMPLES)), gain: GAIN, codec,
           });
         }
         debugFrameCount++;
-        
+
         if (audioResampler) {
           const frame8k = new AudioFrame(pcm8k, 8000, NUM_CHANNELS, FRAME_SAMPLES);
           const resampledFrames = audioResampler.push(frame8k);
@@ -173,14 +177,10 @@ function runBridge(
             resampledAccum = appendToInt16Array(resampledAccum, outFrame.data as Int16Array);
           }
 
-          const TARGET_SAMPLES = 960; // 20ms @ 48000Hz
           while (resampledAccum.length >= TARGET_SAMPLES) {
-            const pcmChunk = resampledAccum.subarray(0, TARGET_SAMPLES);
-            const framePcm = new Int16Array(pcmChunk); // copy to fresh memory
+            const framePcm = new Int16Array(resampledAccum.subarray(0, TARGET_SAMPLES));
             resampledAccum = resampledAccum.subarray(TARGET_SAMPLES);
-
-            const frame48k = new AudioFrame(framePcm, 48000, NUM_CHANNELS, TARGET_SAMPLES);
-            await audioSource.captureFrame(frame48k);
+            await audioSource.captureFrame(new AudioFrame(framePcm, 48000, NUM_CHANNELS, TARGET_SAMPLES));
           }
         }
       }
@@ -188,13 +188,17 @@ function runBridge(
       logger.error("[bridge] Audio queue error", { error: (err as Error).message });
     } finally {
       isFlushing = false;
+      // Audio arrived while we were draining — process it immediately without waiting for next packet
+      if (pendingDrain && mulawAccum.length >= FRAME_SAMPLES) {
+        setImmediate(processAudioQueue);
+      }
     }
   };
 
   // ── Connect to Retell via LiveKit ────────────────────────────────────────
   (async () => {
     try {
-      audioResampler = new AudioResampler(8000, 48000, NUM_CHANNELS, AudioResamplerQuality.HIGH);
+      audioResampler = new AudioResampler(8000, 48000, NUM_CHANNELS, AudioResamplerQuality.QUICK);
       logger.info("[bridge] AudioResampler initialized (8000Hz -> 48000Hz)");
       audioSource = new AudioSource(48000, NUM_CHANNELS);
       localTrack = LocalAudioTrack.createAudioTrack("microphone", audioSource);
