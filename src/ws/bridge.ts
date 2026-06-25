@@ -145,9 +145,17 @@ function runBridge(
           pcm8k[i] = s;
         }
 
-        // Log RMS of first 20 frames sent to Retell for diagnostics
+        const rms = Math.sqrt(rmsSum / FRAME_SAMPLES);
+        // Always log the first non-silent frame to confirm caller audio arrives
+        if (debugFrameCount === 0 && rms > 0) {
+          logger.info("[bridge] First non-silent inbound audio frame from caller", {
+            frame: debugFrameCount,
+            rms: Math.round(rms),
+            codec: codec,
+          });
+        }
+        // Log first 20 frames for baseline diagnostics
         if (debugFrameCount < 20) {
-          const rms = Math.sqrt(rmsSum / FRAME_SAMPLES);
           logger.debug("[bridge] Inbound audio frame RMS (after gain)", {
             frame: debugFrameCount,
             rms: Math.round(rms),
@@ -155,8 +163,8 @@ function runBridge(
             sampleRate: 8000,
             codec: codec,
           });
-          debugFrameCount++;
         }
+        debugFrameCount++;
         
         if (audioResampler) {
           const frame8k = new AudioFrame(pcm8k, 8000, NUM_CHANNELS, FRAME_SAMPLES);
@@ -320,9 +328,9 @@ function runBridge(
           ? (event.payload as Buffer)
           : Buffer.from(event.payload as string, "base64");
 
-        if (chunkCounter < 10) {
+        if (debugFrameCount < 20) {
           logger.debug("[bridge] Incoming Smartflow audio buffer snippet", {
-            chunkCounter,
+            inboundFramesSeen: debugFrameCount,
             length: incomingBuf.length,
             hex: incomingBuf.toString("hex").substring(0, 32)
           });
@@ -395,7 +403,8 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
 
     const adapter = getAdapter("smartflow");
     let bridgeStarted = false;
-    let mulawBuffer: Buffer[] = []; // Buffer audio that arrives before bridge is up
+    // Store original raw WebSocket messages so the bridge adapter can decode them as JSON
+    let rawBuffer: WebSocket.RawData[] = [];
 
     const staticHandler = async (raw: WebSocket.RawData) => {
       const event = adapter.decode(raw);
@@ -437,11 +446,11 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
             initialCodec,
           );
 
-          // Replay any buffered audio events into the new bridge
-          for (const buf of mulawBuffer) {
-            smartflowWs.emit("message", buf, false);
+          // Replay buffered raw messages through the new bridge handler
+          for (const bufferedRaw of rawBuffer) {
+            smartflowWs.emit("message", bufferedRaw, false);
           }
-          mulawBuffer = [];
+          rawBuffer = [];
 
         } catch (err) {
           logger.error("[bridge] Static-mode: failed to register Retell call", {
@@ -453,14 +462,11 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
         return;
       }
 
-      // Buffer audio that arrives while we're registering
+      // Buffer raw messages that arrive while we're awaiting Retell registration
       if (event.type === "audio") {
-        const incomingBuf: Buffer = Buffer.isBuffer(event.payload)
-          ? (event.payload as Buffer)
-          : Buffer.from(event.payload as string, "base64");
-        mulawBuffer.push(incomingBuf);
-        if (mulawBuffer.length % 50 === 0) {
-          logger.debug("[bridge] Static-mode: buffered audio frames", { count: mulawBuffer.length });
+        rawBuffer.push(raw);
+        if (rawBuffer.length % 50 === 0) {
+          logger.debug("[bridge] Static-mode: buffered audio frames", { count: rawBuffer.length });
         }
       }
     };
