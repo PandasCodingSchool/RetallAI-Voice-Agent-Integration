@@ -1,6 +1,6 @@
 # RetallAI Voice Agent + Tata Smartflow Bridge
 
-Node.js (TypeScript) middleware running on AWS ECS Fargate that bridges Tata Smartflow's bidirectional audio WebSocket stream to Retell AI in real-time.
+Node.js (TypeScript) middleware running on Railway that bridges Tata Smartflow's bidirectional audio WebSocket stream to Retell AI in real-time.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ Tata Smartflow
     │  JSON+base64 µ-law protocol (Twilio-compatible)
     │
     ▼
-Node.js Bridge  (ECS Fargate / Cloudflare Tunnel)
+Node.js Bridge  (Railway / Cloudflare Tunnel)
     │
     │  Decodes:  { event:"media", media:{ payload:<base64 µ-law> } }  →  raw Buffer
     │  Encodes:  raw Buffer  →  { event:"media", media:{ payload:<base64 µ-law> } }
@@ -52,7 +52,7 @@ src/
     retellService.ts        # Retell AI REST API (register call)
   utils/
     sessionStore.ts         # In-memory Map with TTL cleanup (stores vendor per session)
-    logger.ts               # Structured JSON logger (CloudWatch-ready)
+    logger.ts               # Structured JSON logger (Railway-compatible)
 public/
   test-call.html            # Browser-based live call tester (uses official Retell SDK)
 test/
@@ -166,63 +166,79 @@ npm start         # runs compiled output
 npm run lint      # type-check only
 ```
 
-## AWS ECS Fargate Deployment
+## Railway Deployment
+
+Railway auto-deploys from GitHub and provisions HTTPS + WebSocket support out of the box — no ALB, certificates, or container registry setup required.
 
 ### Prerequisites
 
-- AWS CLI configured
-- ECR repository created: `retallai-smartflow-bridge`
-- ECS cluster created
-- ALB with HTTPS listener (ACM cert) and WebSocket support enabled
-- Secrets in AWS Secrets Manager:
-  - `retallai/api-key` → `RETELL_API_KEY`
-  - `retallai/agent-id` → `RETELL_AGENT_ID`
-  - `retallai/server-wss-host` → `SERVER_WSS_HOST` (ALB hostname only, no `https://`)
+- [Railway account](https://railway.app) and the Railway CLI installed (`npm i -g @railway/cli`)
+- GitHub repository connected to Railway (or deploy via CLI)
 
 ### Steps
 
+**1. Create a new Railway project**
+
 ```bash
-# 1. Build & push Docker image
-aws ecr get-login-password --region <REGION> | \
-  docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
-
-docker build -t retallai-smartflow-bridge .
-docker tag retallai-smartflow-bridge:latest \
-  <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/retallai-smartflow-bridge:latest
-docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/retallai-smartflow-bridge:latest
-
-# 2. Register task definition
-aws ecs register-task-definition \
-  --cli-input-json file://ecs-task-definition.json
-
-# 3. Create ECS service (single task for POC)
-aws ecs create-service \
-  --cluster <CLUSTER_NAME> \
-  --service-name retallai-smartflow-bridge \
-  --task-definition retallai-smartflow-bridge \
-  --desired-count 1 \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[<SUBNET_ID>],securityGroups=[<SG_ID>],assignPublicIp=ENABLED}" \
-  --load-balancers "targetGroupArn=<TG_ARN>,containerName=retallai-smartflow-bridge,containerPort=3000"
+railway login
+railway init
 ```
 
-### Security Groups
+Or connect your GitHub repo from the Railway dashboard — Railway will detect the `Dockerfile` and build automatically.
 
-| Resource | Inbound               | Outbound                            |
-| -------- | --------------------- | ----------------------------------- |
-| ALB      | 443 from `0.0.0.0/0`  | ECS task SG on port 3000            |
-| ECS Task | Port 3000 from ALB SG | `0.0.0.0/0` (outbound to Retell AI) |
+**2. Set environment variables**
+
+In the Railway dashboard → your service → **Variables**, add:
+
+| Variable              | Value                                              |
+| --------------------- | -------------------------------------------------- |
+| `RETELL_API_KEY`      | Your Retell AI API key                             |
+| `RETELL_AGENT_ID`     | Your Retell AI agent ID                            |
+| `SERVER_WSS_HOST`     | Your Railway public domain (e.g. `your-app.up.railway.app`) — no `https://` prefix |
+| `PORT`                | `3000` (Railway injects `PORT` automatically too)  |
+
+Or set them via CLI:
+
+```bash
+railway variables set RETELL_API_KEY=<key>
+railway variables set RETELL_AGENT_ID=<agent_id>
+railway variables set SERVER_WSS_HOST=<your-app>.up.railway.app
+```
+
+**3. Deploy**
+
+```bash
+railway up
+```
+
+Railway builds the Docker image, deploys it, and assigns a public HTTPS domain. WebSocket (`wss://`) is supported on the same domain automatically.
+
+**4. Get your public domain**
+
+```bash
+railway domain
+# → your-app.up.railway.app
+```
+
+Set this as `SERVER_WSS_HOST` (without `https://`).
+
+### Health check
+
+```bash
+curl https://your-app.up.railway.app/health
+# → {"status":"ok","activeSessions":0,...}
+```
 
 ## Configure Smartflow
 
 In Smartflow → Voice Streaming → Dynamic Endpoint:
 
-| Field          | Value                                      |
-| -------------- | ------------------------------------------ |
-| Endpoint type  | Dynamic                                    |
-| Method         | POST                                       |
-| URL            | `https://<your-alb-domain>/voice/endpoint` |
-| Response field | `wss_url`                                  |
+| Field          | Value                                                  |
+| -------------- | ------------------------------------------------------ |
+| Endpoint type  | Dynamic                                                |
+| Method         | POST                                                   |
+| URL            | `https://<your-app>.up.railway.app/voice/endpoint`     |
+| Response field | `wss_url`                                              |
 
 Smartflow will POST `callId`, `fromNumber`, `toNumber`, `status` and use the returned `wss_url` to open the audio stream.
 
