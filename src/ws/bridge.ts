@@ -154,8 +154,8 @@ function runBridge(
             codec: codec,
           });
         }
-        // Log first 20 frames for baseline diagnostics
-        if (debugFrameCount < 20) {
+        // Log first 20 frames for baseline, then every 50th frame for ongoing visibility
+        if (debugFrameCount < 20 || debugFrameCount % 50 === 0) {
           logger.debug("[bridge] Inbound audio frame RMS (after gain)", {
             frame: debugFrameCount,
             rms: Math.round(rms),
@@ -206,9 +206,24 @@ function runBridge(
       room.on(RoomEvent.Connected, async () => {
         logger.info("[bridge] LiveKit room connected", { retellCallId, roomName: room.name });
 
-        const pub = await room.localParticipant?.publishTrack(localTrack!, publishOpts);
-        publishedTrackSid = pub?.sid;
-        logger.info("[bridge] Published user audio track to Retell LiveKit room");
+        try {
+          if (!room.localParticipant) {
+            throw new Error("localParticipant is null after Connected event");
+          }
+          const pub = await room.localParticipant.publishTrack(localTrack!, publishOpts);
+          publishedTrackSid = pub?.sid;
+          logger.info("[bridge] Published user audio track to Retell LiveKit room", {
+            retellCallId,
+            trackSid: publishedTrackSid,
+          });
+        } catch (err) {
+          logger.error("[bridge] CRITICAL: failed to publish audio track to Retell", {
+            retellCallId,
+            error: (err as Error).message,
+          });
+          cleanup("publish-track-failed");
+          return;
+        }
 
         // Flush buffered audio that arrived before LiveKit connected
         if (mulawAccum.length > 0) {
