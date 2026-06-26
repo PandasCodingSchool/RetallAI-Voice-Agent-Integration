@@ -445,12 +445,25 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
     // Store original raw WebSocket messages so the bridge adapter can decode them as JSON
     let rawBuffer: WebSocket.RawData[] = [];
 
+    // Speculative Retell call registration: kicked off at the Smartflow "connected" handshake
+    // (~300-400ms before the "start" event arrives), so the API round-trip overlaps with
+    // Smartflow's own setup rather than sitting on the critical path.
+    let speculativeCallId = `sf-static-${uuidv4()}`;
+    let speculativeCallPromise: Promise<{ call_id: string; access_token: string }> | null = null;
+
     const staticHandler = async (raw: WebSocket.RawData) => {
       const event = adapter.decode(raw);
       if (!event) return;
 
       if (event.type === "connected") {
-        logger.info("[bridge] Static-mode: connected handshake received");
+        logger.info("[bridge] Static-mode: connected handshake received — pre-registering Retell call");
+        speculativeCallPromise = registerCall("unknown", "unknown", speculativeCallId).catch((err) => {
+          logger.warn("[bridge] Speculative Retell registration failed, will retry on start event", {
+            error: (err as Error).message,
+          });
+          speculativeCallPromise = null;
+          return null as unknown as { call_id: string; access_token: string };
+        });
         return;
       }
 
@@ -459,17 +472,25 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
         const streamSid = event.streamSid;
         const fromNumber = event.from ?? "unknown";
         const toNumber = event.to ?? "unknown";
-        const callId = `sf-static-${uuidv4()}`;
 
-        logger.info("[bridge] Static-mode: start event — registering Retell call", {
-          callId,
+        logger.info("[bridge] Static-mode: start event", {
+          callId: speculativeCallId,
           fromNumber,
           toNumber,
           streamSid,
         });
 
         try {
-          const retellCall = await registerCall(fromNumber, toNumber, callId);
+          // Await the speculative registration (likely already done); fall back to a fresh call if it failed.
+          let retellCall = speculativeCallPromise ? await speculativeCallPromise : null;
+          if (!retellCall || !retellCall.call_id) {
+            const callId = `sf-static-${uuidv4()}`;
+            logger.info("[bridge] Falling back to fresh Retell registration", { callId });
+            retellCall = await registerCall(fromNumber, toNumber, callId);
+            speculativeCallId = callId;
+          } else {
+            logger.info("[bridge] Using pre-registered Retell call", { retellCallId: retellCall.call_id });
+          }
 
           // Remove this provisional handler; runBridge attaches its own
           smartflowWs.removeAllListeners("message");
@@ -480,7 +501,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
             retellCall.call_id,
             retellCall.access_token,
             "smartflow",
-            callId,
+            speculativeCallId,
             streamSid,
             initialCodec,
           );
@@ -493,7 +514,7 @@ export function attachWebSocketBridge(server: http.Server): WebSocketServer {
 
         } catch (err) {
           logger.error("[bridge] Static-mode: failed to register Retell call", {
-            callId,
+            callId: speculativeCallId,
             error: (err as Error).message,
           });
           smartflowWs.close(1011, "Retell registration failed");
